@@ -163,6 +163,30 @@ bracketed paste, where a newline is a newline rather than a submit.
 terminal, which is what used to hang `hw close`, and one unscrollable line is a
 poor place to write a paragraph.
 
+## Tests
+
+```sh
+./test/run.sh                 # contract, unit, integration
+./test/run.sh unit            # one suite
+```
+
+| Suite | What it covers |
+|---|---|
+| `contract` | hw parses, shellcheck is clean, no bash 4 constructs (macOS ships 3.2 only), every `herdr` subcommand and flag hw calls still exists, every JSON path it reads is still there |
+| `unit` | slugs and branch naming, all five `worktree_state` shapes, quarantine, review marks, cache staleness, `compose`, log trimming, project naming |
+| `integration` | spawn, resume, detached setup and teardown jobs, teardown of every broken checkout shape, review markers reaching the sidebar, `sync`, `doctor`, exit statuses, and the missing-server guard |
+
+The integration suite runs a herdr server of its own under `XDG_CONFIG_HOME`,
+`XDG_STATE_HOME` and an explicit `HERDR_SOCKET_PATH` inside one temp directory,
+with throwaway git repos. It refuses to start unless the socket, `HW_ROOT` and
+`HW_CACHE` are all inside that directory: the first attempt at this silently
+drove the real session, because a readiness check that accepts any successful
+CLI call is answered by whatever server is already running.
+
+Spawn entry points cannot be driven from a test — they pick through fzf, which
+opens `/dev/tty` and so ignores anything stdin offers. The tests call
+`create_worktree`, which is what all of them funnel into.
+
 ## Branch naming
 
 A prompted worktree gets a short name, not a slug of the whole sentence:

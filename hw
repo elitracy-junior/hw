@@ -31,6 +31,7 @@
 set -euo pipefail
 
 HW_CONFIG="${HW_CONFIG:-$HOME/.config/hw/config.sh}"
+# shellcheck source=/dev/null  # the path is the user's, by design
 [[ -r $HW_CONFIG ]] && . "$HW_CONFIG"
 
 HW_ROOT="${HW_ROOT:-$HOME/Documents/worktrees}"
@@ -113,6 +114,7 @@ esc:abort}"
 # manual pairs it with, so the first `result` lands after the list is loaded.
 #
 # Its own --bind, so overriding HW_FZF_BIND cannot drop it.
+# shellcheck disable=SC2016  # fzf's own shell expands HW_FZF_HOME, not this one
 _fzf() {
   fzf --cycle --height=100% --reverse --sync --bind "$HW_FZF_BIND" \
       --bind 'result:transform:[ -z {q} ] && echo "pos(${HW_FZF_HOME:-1})" || echo first' \
@@ -125,7 +127,7 @@ _fzf() {
 # where `rev-parse` in each checkout is a process per row. The pickers join
 # against this instead of shelling out per line.
 branch_map() {
-  local ws_json=${1:?} root roots tmp gitdir
+  local ws_json=${1:?} root roots tmp
   roots=$(jq -r '[.result.workspaces[]?.worktree.repo_root // empty] | unique | .[]' \
           <<<"$ws_json" 2>/dev/null) || roots=""
   [[ -z $roots ]] && return 0
@@ -204,6 +206,9 @@ compose() {
   # end of a template, so asking for a random name AND a .md extension in one
   # call silently gives a fixed path in a shared directory. The extension is
   # what makes nvim treat the buffer as prose.
+  # A killed editor runs no trap, so sweep what earlier runs left behind.
+  find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'hw-prompt-*' -type d -mtime +0 \
+    -exec rm -rf {} + 2>/dev/null || true
   dir=$(mktemp -d "${TMPDIR:-/tmp}/hw-prompt-XXXXXX") || return 1
   file="$dir/prompt.md"
   printf '\n# what are you working on? write as much as you like.\n# lines starting with # are ignored; save an empty file to cancel.\n' \
@@ -261,7 +266,7 @@ slug_concise() {
 # 2-4 word name, since slugging the whole sentence produces things like
 # `eli/can-you-create-new-sessions-for-my-nvim-git-plug`.
 branch_name_for() {
-  local prompt=${1:?} name="" tmp pid waited=0 limit
+  local prompt=${1:-} name="" tmp pid waited=0 limit
   limit=$(( ${HW_NAME_TIMEOUT:-15} * 10 ))
 
   if [[ ${HW_SMART_BRANCH:-1} == 1 ]] && command -v claude >/dev/null 2>&1; then
@@ -300,10 +305,22 @@ current_branch() { git rev-parse --abbrev-ref HEAD 2>/dev/null || true; }
 
 # Project name for a checkout path: the directory under $HW_ROOT.
 project_of() {
-  local p=${1:?} rel
+  local p=${1:?} rel name
   rel=${p#"$HW_ROOT"/}
-  [[ $rel == "$p" ]] && { basename "$p"; return; }
-  printf '%s' "${rel%%/*}"
+  if [[ $rel != "$p" ]]; then
+    printf '%s' "${rel%%/*}"
+    return
+  fi
+  # Outside the worktree root this is a checkout registered in place, and its
+  # registered name need not match its directory name. Guessing the basename
+  # made `repo_ref` miss it, which silently skipped the repo's setup hook and
+  # its .env copying -- it only ever worked where the two names coincided.
+  name=$(registry_name_for_src "$p" 2>/dev/null) || name=""
+  if [[ -n $name ]]; then
+    printf '%s' "$name"
+    return
+  fi
+  basename "$p"
 }
 
 default_branch_of() {
@@ -423,13 +440,23 @@ cmd_add() {
 }
 
 cmd_projects() {
+  local d n
   { registry_list | awk -F'\t' '{printf "%s\tregistered\t%s\n", $1, $2}'
     for d in "$HW_ROOT"/*/; do
+      # An unmatched glob comes through as the pattern itself.
+      [[ -d $d ]] || continue
       n=$(basename "$d")
       [[ $n == .hw-trash ]] && continue
       [[ -n $(registry_src "$n") ]] && continue
-      [[ -d "${d}.bare" ]] && printf '%s\tbare\t%s\n' "$n" "${d}.bare"
+      if [[ -d "${d}.bare" ]]; then
+        printf '%s\tbare\t%s\n' "$n" "${d}.bare"
+      fi
     done
+    # The last test in the loop decided this group's status, and under pipefail
+    # that became the command's. A project without a .bare is the ordinary case,
+    # so `hw projects` printed the right list and exited 1 -- which in a popup
+    # stops on "[enter to close]" as though something had gone wrong.
+    :
   } | sort -u | column -t -s$'\t'
 }
 
@@ -457,15 +484,21 @@ ensure_repo() {
 
 # Workspace currently open on a checkout path, if any.
 workspace_for_path() {
-  local p=${1:?} ws
+  local p=${1:?} ws real
+  # herdr records the resolved path, so a path hw built by hand only matches
+  # while no component is a symlink. Ask about both.
+  real=$(real_path "$p")
   ws=$(herdr workspace list 2>/dev/null \
-       | jq -r --arg p "$p" \
-         '.result.workspaces[]? | select(.worktree.checkout_path == $p) | .workspace_id' \
+       | jq -r --arg p "$p" --arg r "$real" \
+         '.result.workspaces[]?
+          | select(.worktree.checkout_path == $p or .worktree.checkout_path == $r)
+          | .workspace_id' \
        | head -1)
   [[ -n $ws ]] && { printf '%s' "$ws"; return; }
   # Flat sessions are plain workspaces, so match on the root pane's cwd.
   herdr pane list 2>/dev/null \
-    | jq -r --arg p "$p" '.result.panes[]? | select(.cwd == $p) | .workspace_id' \
+    | jq -r --arg p "$p" --arg r "$real" \
+      '.result.panes[]? | select(.cwd == $p or .cwd == $r) | .workspace_id' \
     | head -1
 }
 
@@ -502,21 +535,25 @@ review_mark() {
   # An `if`, not `review_is ... && return`: an AND-list whose first command
   # fails is exactly the shape that has tripped errexit here before.
   if review_is "$path"; then return 0; fi
-  printf '%s\n' "$path" >> "$HW_REVIEWS"
+  printf '%s\n' "$(real_path "$path")" >> "$HW_REVIEWS"
 }
 
 review_unmark() {
   local path=${1:?} tmp
   [[ -s $HW_REVIEWS ]] || return 0
   tmp=$(mktemp) || return 0
-  grep -vxF "$path" "$HW_REVIEWS" > "$tmp" 2>/dev/null || true
+  grep -vxF "$(real_path "$path")" "$HW_REVIEWS" > "$tmp" 2>/dev/null || true
   mv "$tmp" "$HW_REVIEWS"
 }
 
+# The review store is keyed by checkout path, and the two sides of that lookup
+# do not agree on how to spell one: hw builds a path, herdr reports the resolved
+# one. Everything here canonicalises first, so a mark survives the round trip
+# however the caller spelled it.
 review_is() {
   local path=${1:?}
   [[ -s $HW_REVIEWS ]] || return 1
-  grep -qxF "$path" "$HW_REVIEWS" 2>/dev/null
+  grep -qxF "$(real_path "$path")" "$HW_REVIEWS" 2>/dev/null
 }
 
 # PR state for the branches you actually have checked out, cached.
@@ -646,7 +683,23 @@ quarantine_path() {
 # be backgrounded either: closing a pane makes herdr signal that pane's whole
 # session, so a plain `&` job dies with the popup that started it. setsid puts
 # the job in a session of its own, where the sweep cannot reach it.
+# Keep an append-only log from growing without bound. Cheap enough to call on
+# every write: one stat, and a rewrite only when it has actually got too big.
+trim_log() {
+  local f=${1:?} keep=${2:-500} size
+  [[ -f $f ]] || return 0
+  size=$(stat -f %z "$f" 2>/dev/null) || size=$(stat -c %s "$f" 2>/dev/null) || return 0
+  (( size > ${HW_LOG_MAX_BYTES:-262144} )) || return 0
+  if tail -n "$keep" "$f" > "$f.trim" 2>/dev/null; then
+    mv "$f.trim" "$f" 2>/dev/null || rm -f "$f.trim"
+  else
+    rm -f "$f.trim"
+  fi
+  return 0
+}
+
 detach() {
+  trim_log "$HW_JOBLOG"
   perl -e 'use POSIX qw(setsid); setsid() or die "setsid: $!";
            exec { $ARGV[0] } @ARGV or die "exec: $!"' \
     -- "$@" >>"$HW_JOBLOG" 2>&1 </dev/null &
@@ -730,6 +783,29 @@ job_setup() {
   return 0
 }
 
+# Resolve a path the way git reports one.
+#
+# `git worktree list` prints canonical paths, so comparing its output against a
+# path hw built by hand only works while no component is a symlink. On macOS
+# /tmp and /var both are, which made every registered worktree under them read
+# as unregistered -- `ready` became `orphan`, `stale` became `absent`. The
+# directory need not exist: the deepest existing parent is resolved and the
+# rest appended, because callers ask about paths that are gone.
+real_path() {
+  local p=${1:?}
+  local head=$p tail=""
+  while [[ ! -d $head && $head == */* ]]; do
+    tail="/${head##*/}$tail"
+    head=${head%/*}
+    [[ -z $head ]] && head=/
+  done
+  [[ -d $head ]] || { printf '%s' "$p"; return 0; }
+  head=$(cd -P -- "$head" 2>/dev/null && pwd -P) || { printf '%s' "$p"; return 0; }
+  head=${head%/}
+  [[ -z $head && -z $tail ]] && { printf '/'; return 0; }
+  printf '%s' "$head$tail"
+}
+
 # Classify the on-disk/git state of a candidate worktree path. Echoes one of:
 #   ready    registered with git and usable
 #   orphan   directory has a .git pointer but git has no admin data for it
@@ -738,9 +814,12 @@ job_setup() {
 #   absent   nothing there
 worktree_state() {
   local main=${1:?} path=${2:?}
-  local registered=0
-  git -C "$main" worktree list --porcelain 2>/dev/null \
-    | grep -qxF "worktree $path" && registered=1
+  local registered=0 want
+  want=$(real_path "$path")
+  if git -C "$main" worktree list --porcelain 2>/dev/null \
+       | awk '/^worktree /{ print substr($0, 10) }' | grep -qxF "$want"; then
+    registered=1
+  fi
 
   if [[ -d $path ]]; then
     if (( registered )) && git -C "$path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -835,7 +914,7 @@ create_worktree() {
 
   if (( ! resumed )); then
     holder=$(worktree_holding_branch "$src" "$branch")
-    if [[ -n $holder && $holder != "$path" && -d $holder ]]; then
+    if [[ -n $holder && $(real_path "$holder") != "$(real_path "$path")" && -d $holder ]]; then
       warn "$branch is already checked out at $holder"
       path="$holder"; resumed=1
     elif [[ -n $holder ]]; then
@@ -938,8 +1017,13 @@ run_setup() {
 
   if [[ -x $main/.herdr/setup.sh ]]; then
     info "running .herdr/setup.sh"
+    # The hook belongs to the project, so it is run from the canonical checkout
+    # with the new worktree as its working directory. Running `./.herdr/setup.sh`
+    # instead asked the new worktree for a file the test had just found in the
+    # canonical one: a hook that was uncommitted, or that postdates the branch
+    # being checked out, is simply not there and setup silently did nothing.
     # Hook output goes to stderr so it cannot pollute a captured workspace id.
-    ( cd "$path" && HW_WORKTREE="$path" HW_MAIN="$main" ./.herdr/setup.sh >&2 ) \
+    ( cd "$path" && HW_WORKTREE="$path" HW_MAIN="$main" "$main/.herdr/setup.sh" >&2 ) \
       || warn "setup.sh exited non-zero"
   fi
   return 0
@@ -1389,6 +1473,7 @@ here_workspace() {
 # instant. Turn it on for a run with `HW_DEBUG=1 hw reviews`.
 hw_debug_env() {
   [[ ${HW_DEBUG:-0} == 1 ]] || return 0
+  trim_log "$HW_CACHE/context.log"
   printf '%s\t%s\tenv_ws=%s\tenv_pane=%s\tfocused_pane=%s\tfocused_ws=%s\tfocused_agent=%s\n' \
     "$(date +%H:%M:%S)" "${1:-?}" "${HERDR_WORKSPACE_ID:-}" "${HERDR_PANE_ID:-}" \
     "$(herdr pane list 2>/dev/null | jq -r '[.result.panes[]?|select(.focused)|.pane_id]|join(",")')" \
@@ -1407,7 +1492,7 @@ pretty_path() {
   if [[ $p == "$HW_ROOT"/* ]]; then
     printf '%s' "${p#"$HW_ROOT"/}"
   else
-    printf '%s' "~${p#$HOME}"
+    printf '%s' "~${p#"$HOME"}"
   fi
 }
 
@@ -1883,7 +1968,11 @@ The branch is checked out in this worktree. Read the diff against its base, foll
          | jq -r --arg w "$ws" '.result.workspaces[]?
                                 | select(.workspace_id == $w)
                                 | .worktree.checkout_path // empty')
-  [[ -n $path ]] && review_mark "$path" || warn "could not record $ws as a review"
+  if [[ -n $path ]]; then
+    review_mark "$path" || warn "could not record $ws as a review"
+  else
+    warn "could not find a checkout for $ws"
+  fi
   sync_space_markers "$(herdr workspace list 2>/dev/null)"
 }
 
@@ -1912,8 +2001,30 @@ cmd_menu() { cmd_spawn; }
 
 usage() { sed -n '2,30p' "$0" | grep '^#' | sed 's/^# \{0,1\}//'; }
 
+# Is a herdr server answering?
+#
+# Every herdr call in this script sends its output to /dev/null and shrugs off
+# failure, which is right when one call fails and wrong when no server is there
+# at all: each picker then comes up empty and nothing says why. Checked once per
+# run, for the subcommands that cannot do anything without one.
+herdr_ready() {
+  command -v herdr >/dev/null 2>&1 || return 1
+  herdr workspace list >/dev/null 2>&1
+}
+
+needs_herdr() {
+  case "${1:?}" in
+    spawn|menu|proj|p|new|n|branch|b|linear|l|rm|spaces|s|agents|ag|reviews|rv|\
+      close|x|doctor|sync|watch|__teardown|__setup) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 main() {
   local sub=${1:-menu}; shift || true
+  if needs_herdr "$sub" && ! herdr_ready; then
+    die "no herdr server is answering at ${HERDR_SOCKET_PATH:-the default socket}. Start one with \`herdr\`."
+  fi
   case "$sub" in
     spawn|menu)    cmd_spawn ;;
     proj|p)        cmd_proj ;;
