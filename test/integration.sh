@@ -62,16 +62,37 @@ wait_until '[[ -z $(token '"$ws3"' hw_status) ]]' 60 \
   && ok "the status clears when the job ends" \
   || bad "the status clears when the job ends"
 
-group "a detached job survives its caller exiting"
-# This is the whole point of setsid: a plain background job would be signalled
-# with the pane that started it.
+group "a detached job survives its caller being killed off"
+# herdr signals every process in a closing pane's session. This sweeps the
+# caller's session the same way, which is as close as a test gets -- it does not
+# reproduce the narrow window between forking the job and its setsid, so it
+# proves the job is in its own session, not that the window is shut.
 marker="$HWT_DIR/outlives-caller"
-( hwt_source_hw; detach /bin/sh -c "sleep 2; touch '$marker'" ) &
-caller=$!
-wait $caller
-wait_until "[[ -f '$marker' ]]" 40 \
-  && ok "the job finished after its caller was gone" \
-  || bad "the job finished after its caller was gone"
+rm -f "$marker"
+cat > "$HWT_DIR/caller.sh" <<CALLER
+#!/bin/bash
+set -uo pipefail
+HW_LIB=1 . "$HWT_HW"
+set +e
+detach /bin/sh -c "sleep 3; touch '$marker'"
+echo \$\$ > "$HWT_DIR/caller.pid"
+CALLER
+chmod +x "$HWT_DIR/caller.sh"
+perl -e 'use POSIX qw(setsid); setsid(); exec { $ARGV[0] } @ARGV' -- "$HWT_DIR/caller.sh" \
+  >/dev/null 2>&1
+caller_pid=$(cat "$HWT_DIR/caller.pid" 2>/dev/null || echo 0)
+# Everything still in the caller's session goes, SIGKILL and all.
+if [[ $caller_pid -gt 0 ]]; then
+  sid=$(ps -o sess= -p "$caller_pid" 2>/dev/null | tr -d ' ')
+  for pid in $(ps -ax -o pid=,sess= 2>/dev/null \
+                | awk -v s="${sid:-none}" '$2 == s { print $1 }'); do
+    [[ $pid == "$$" ]] && continue
+    kill -9 "$pid" 2>/dev/null || true
+  done
+fi
+wait_until "[[ -f '$marker' ]]" 60 \
+  && ok "the job finished after its caller's session was swept" \
+  || bad "the job finished after its caller's session was swept"
 
 group "tearing a worktree down removes the checkout and closes the space"
 teardown_path="$HW_ROOT/alpha/feature-one"
@@ -176,7 +197,16 @@ rc=0; hw help >/dev/null 2>&1 || rc=$?
 assert_eq "0" "$rc" "hw help still works without a server"
 export HERDR_SOCKET_PATH=$saved_socket
 
-group "the job log recorded the work"
+group "the job log records enough to debug a failed spawn"
 assert_file "$HW_JOBLOG" "a job log was written"
+log=$(cat "$HW_JOBLOG" 2>/dev/null)
+assert_contains "$log" "spawn "    "it records each spawn"
+assert_contains "$log" "detach "   "it records each job handed off"
+assert_contains "$log" "setup "    "it records the setup job starting"
+assert_contains "$log" "teardown " "it records the teardown job starting"
+# A popup is gone before its output can be read, so these are the only trace of
+# what a spawn did. "detach" without the matching "setup" means the job was
+# handed off and never started.
+assert_contains "$log" "pane="     "the setup line names the pane it will seed"
 
 summary

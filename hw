@@ -698,12 +698,40 @@ trim_log() {
   return 0
 }
 
-detach() {
+# Record a line in the job log. A popup closes the moment its command exits, so
+# anything printed there is gone before it can be read; this is what is left.
+job_log() {
   trim_log "$HW_JOBLOG"
+  printf '%s %s\n' "$(date +%FT%T)" "$*" >> "$HW_JOBLOG" 2>/dev/null || true
+  return 0
+}
+
+detach() {
+  local ready waited=0
+  job_log "detach $*"
+  ready=$(mktemp "${TMPDIR:-/tmp}/hw-detach-XXXXXX") || ready=""
+  HW_DETACH_READY=$ready \
   perl -e 'use POSIX qw(setsid); setsid() or die "setsid: $!";
+           if (my $f = $ENV{HW_DETACH_READY}) {
+             if (open(my $fh, ">", $f)) { print $fh "1"; close $fh; }
+           }
            exec { $ARGV[0] } @ARGV or die "exec: $!"' \
     -- "$@" >>"$HW_JOBLOG" 2>&1 </dev/null &
   disown 2>/dev/null || true
+  # Do not return until the job is in a session of its own.
+  #
+  # The caller is usually about to exit, and herdr signals every process in a
+  # closing pane's session. Returning while the job is still forking leaves it
+  # to be killed in that race -- which is what stopped a prompted worktree from
+  # ever running its setup hook or starting its agent: the space appeared and
+  # nothing else happened, with nothing in the job log to say why.
+  if [[ -n $ready ]]; then
+    while [[ ! -s $ready && $waited -lt 200 ]]; do
+      sleep 0.01
+      waited=$((waited + 1))
+    done
+    rm -f "$ready"
+  fi
   return 0
 }
 
@@ -753,7 +781,7 @@ remove_checkout() {
 job_teardown() {
   local path=${1:?} ws=${2:-}
   HW_JOB_WS=$ws
-  printf '%s teardown %s (%s)\n' "$(date +%FT%T)" "$path" "${ws:--}" >&2
+  job_log "teardown $path (${ws:--})"
   # However this ends, the space must not be left reporting work nobody is
   # doing: the row would spin forever with no job behind it.
   trap 'job_status "$HW_JOB_WS" ""' EXIT
@@ -771,7 +799,7 @@ job_teardown() {
 job_setup() {
   local src=${1:?} path=${2:?} ws=${3:?} pane=${4:-} name=${5:-} prompt=${6:-}
   HW_JOB_WS=$ws
-  printf '%s setup %s (%s)\n' "$(date +%FT%T)" "$path" "$ws" >&2
+  job_log "setup $path ($ws) pane=${pane:--} prompt=${#prompt}bytes"
   # However this ends, the space must not be left reporting work nobody is
   # doing: the row would spin forever with no job behind it.
   trap 'job_status "$HW_JOB_WS" ""' EXIT
@@ -948,9 +976,11 @@ create_worktree() {
   # groups every worktree of a repo in the sidebar. For a bare-layout project
   # this also opens a parent workspace on .bare, which is the group header;
   # normalize_main_label relabels it from ".bare" to the project name.
+  job_log "spawn $proj/$name on $wt_branch (resumed=$resumed)"
   out=$(herdr worktree open --cwd "$src" --path "$path" \
           --label "$proj  $wt_branch" --focus) \
-    || die "could not open a session at $path"
+    || { job_log "spawn FAILED: worktree open rejected $path"
+         die "could not open a session at $path"; }
   ws=$(jq -r '.result.workspace.workspace_id' <<<"$out")
   pane=$(jq -r '.result.root_pane.pane_id' <<<"$out")
   [[ -z $ws || $ws == null ]] && die "could not read workspace id from herdr response"
@@ -2014,8 +2044,8 @@ herdr_ready() {
 
 needs_herdr() {
   case "${1:?}" in
-    spawn|menu|proj|p|new|n|branch|b|linear|l|rm|spaces|s|agents|ag|reviews|rv|\
-      close|x|doctor|sync|watch|__teardown|__setup) return 0 ;;
+    spawn|menu|proj|p|new|n|branch|b|linear|l|rm|spaces|s|agents|ag) return 0 ;;
+    reviews|rv|close|x|doctor|sync|watch|__teardown|__setup) return 0 ;;
     *) return 1 ;;
   esac
 }
