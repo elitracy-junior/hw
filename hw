@@ -1,0 +1,1907 @@
+#!/usr/bin/env bash
+# hw — herdr work: worktree spawning, project switching, and git/CI/PR helpers.
+# Replaces the Orca workflow with herdr + nvim + lazygit + gh.
+#
+#   hw spawn          one picker: Linear ticket / branch / prompt / project
+#   hw add [folder]   register an existing local repo as a project
+#   hw projects       list known projects
+#   hw spaces         popup picker over open sessions
+#   hw agents         popup picker over live agents
+#   hw reviews        popup picker over PR review spaces
+#   hw sync           re-assert sidebar markers (herdr drops tokens on restart)
+#   hw proj           pick a repo (clones on demand) and open it
+#   hw new [prompt]   worktree from a prompt, with Claude seeded
+#   hw branch         worktree from an existing branch or PR
+#   hw linear         worktree from a Linear ticket, with Claude seeded
+#   hw linear-auth    store your Linear API key in the keychain
+#   hw ci             CI runs for the current branch (nvim panel is preferred)
+#   hw pr             PR checks and comments (nvim panel is preferred)
+#   hw close          close this session; choose whether the worktree goes too
+#   hw rm             remove a worktree and its workspace
+#
+# Setting a worktree up and tearing one down run as detached jobs: herdr allows
+# one popup at a time, so holding either inside the popup blocks every other hw
+# command. While a job runs its space reports it as `hw_status`, which the
+# sidebar shows under the branch. Job output goes to $HW_JOBLOG.
+#   hw doctor [--fix] find and repair inconsistent worktree/workspace state
+#   hw watch          background poller: CI/PR state into the herdr sidebar
+#
+# Config: ~/.config/hw/config.sh  (sourced; override any HW_* var)
+
+set -euo pipefail
+
+HW_CONFIG="${HW_CONFIG:-$HOME/.config/hw/config.sh}"
+[[ -r $HW_CONFIG ]] && . "$HW_CONFIG"
+
+HW_ROOT="${HW_ROOT:-$HOME/Documents/worktrees}"
+HW_ORG="${HW_ORG:-myjunior}"
+HW_AGENT="${HW_AGENT:-claude}"
+HW_BRANCH_PREFIX="${HW_BRANCH_PREFIX:-eli/}"
+HW_LINEAR_SERVICE="${HW_LINEAR_SERVICE:-hw-linear}"
+HW_WATCH_INTERVAL="${HW_WATCH_INTERVAL:-90}"
+# Marks a PR-review space, in its label and in every picker. U+F407 is the
+# Nerd Font pull-request glyph: it exists in the terminal font in BOTH regular
+# and bold, which a plain-Unicode arrow like U+21C4 does not. fzf bolds the
+# selected row, so a glyph the font lacks gets a different fallback font per
+# weight and visibly changes size as you move the cursor over it.
+# A branch with an open pull request, and a worktree checked out to review
+# someone's. Both are Nerd Font glyphs present in regular and bold, which a
+# plain-Unicode symbol often is not: fzf bolds the selected row, and a glyph
+# the font lacks resolves to a different fallback face per weight and visibly
+# changes size as the cursor passes over it.
+HW_PR_ICON="${HW_PR_ICON:-}"
+HW_REVIEW_ICON="${HW_REVIEW_ICON:-}"
+HW_CACHE="${HW_CACHE:-$HOME/.cache/hw}"
+# Which worktrees are under review. Defined after HW_CACHE because it is built
+# from it.
+HW_REVIEWS="${HW_REVIEWS:-$HW_CACHE/reviews.tsv}"
+# Branches with an open pull request, as "<repo><tab><branch>". Refreshed by
+# `hw sync` and `hw watch`; the pickers only read it, so opening one never waits
+# on the network.
+HW_PRS="${HW_PRS:-$HW_CACHE/prs.tsv}"
+# "<checkout path>\t<branch>" for every worktree, cached. Rebuilt only when git
+# has touched a HEAD since it was written, so a branch switch is picked up at
+# once while repeated picker opens pay nothing.
+HW_BRANCHES="${HW_BRANCHES:-$HW_CACHE/branches.tsv}"
+# Seconds the branch cache stands before it is rebuilt. Short enough that a
+# checkout made outside hw shows up quickly, long enough that opening a picker
+# repeatedly costs nothing.
+HW_BRANCH_TTL="${HW_BRANCH_TTL:-5}"
+# Where detached jobs write. They have no terminal to report to, so this is the
+# only record of a setup hook or a removal that went wrong.
+HW_JOBLOG="${HW_JOBLOG:-$HW_CACHE/jobs.log}"
+
+mkdir -p "$HW_CACHE"
+
+# Detached jobs re-enter this script, so it has to be addressable by path.
+HW_SELF=$(command -v -- "${BASH_SOURCE[0]}" 2>/dev/null || true)
+[[ -x $HW_SELF ]] || HW_SELF=${BASH_SOURCE[0]}
+
+die()  { printf '\033[31mhw: %s\033[0m\n' "$*" >&2; exit 1; }
+info() { printf '\033[36m==>\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[33mhw: %s\033[0m\n' "$*" >&2; }
+
+need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
+need jq; need git
+
+# fzf has no modal vi mode, so these are the closest single-keystroke analogues.
+# ctrl-h/j/k/l are deliberately absent: herdr binds them globally to
+# herdr-splits pane navigation, so they never reach a program in a popup.
+HW_FZF_BIND="${HW_FZF_BIND:-\
+alt-j:down,alt-k:up,\
+ctrl-n:down,ctrl-p:up,\
+ctrl-d:half-page-down,ctrl-u:half-page-up,\
+ctrl-f:page-down,ctrl-b:page-up,\
+alt-g:first,alt-G:last,\
+alt-w:backward-kill-word,\
+alt-0:beginning-of-line,alt-4:end-of-line,\
+esc:abort}"
+
+# Every picker in hw goes through this so the bindings stay consistent.
+# fzf keeps the cursor's index when the query changes, which lands it part way
+# down a filtered list. Typing should put the best match under the cursor, and
+# clearing the query should put you back where the picker opened -- the row for
+# wherever you already are. HW_FZF_HOME carries that row; a picker that does not
+# set one falls back to the first.
+#
+# `result`, not `change`: fzf's own manual notes that `change` fires before the
+# list is filtered, so the row being asked for may not exist yet and the move is
+# dropped. `result` fires once the filtered list is ready. `--sync` is what the
+# manual pairs it with, so the first `result` lands after the list is loaded.
+#
+# Its own --bind, so overriding HW_FZF_BIND cannot drop it.
+_fzf() {
+  fzf --cycle --height=100% --reverse --sync --bind "$HW_FZF_BIND" \
+      --bind 'result:transform:[ -z {q} ] && echo "pos(${HW_FZF_HOME:-1})" || echo first' \
+      "$@"
+}
+
+# "<checkout path>\t<branch>" for every worktree of every repo in play.
+#
+# One `git worktree list` per repo answers for all of its worktrees at once,
+# where `rev-parse` in each checkout is a process per row. The pickers join
+# against this instead of shelling out per line.
+branch_map() {
+  local ws_json=${1:?} root roots tmp gitdir
+  roots=$(jq -r '[.result.workspaces[]?.worktree.repo_root // empty] | unique | .[]' \
+          <<<"$ws_json" 2>/dev/null) || roots=""
+  [[ -z $roots ]] && return 0
+
+  # `git worktree list` costs about 30ms per repo, which is most of a picker's
+  # run. A branch only changes when git writes a HEAD, so the cache stands until
+  # one of them is newer than it: correct straight after a checkout, and free on
+  # the repeated opens that make the delay annoying.
+  if [[ -s $HW_BRANCHES ]] && ! branch_cache_stale; then
+    cat "$HW_BRANCHES"
+    return 0
+  fi
+
+  tmp=$(mktemp) || tmp=""
+  while read -r root; do
+    [[ -z $root || ! -d $root ]] && continue
+    git -C "$root" worktree list --porcelain 2>/dev/null | awk '
+      /^worktree /       { path = substr($0, 10); next }
+      /^branch refs\/heads\// { sub(/^branch refs\/heads\//, ""); print path "\t" $0; next }
+    '
+  done <<<"$roots" > "${tmp:-/dev/stdout}"
+  if [[ -n $tmp ]]; then
+    cat "$tmp"
+    mv "$tmp" "$HW_BRANCHES" 2>/dev/null || rm -f "$tmp"
+  fi
+}
+
+# Is the branch cache older than it is allowed to be?
+#
+# Checked by age rather than against git's HEAD files: resolving each repo's git
+# directory and walking it costs about as much as the `git worktree list` the
+# cache exists to avoid, which measured no faster than not caching at all. One
+# stat costs nothing, and hw drops the cache itself whenever it moves a worktree,
+# so the window only matters for a checkout made outside hw.
+branch_cache_stale() {
+  local mtime now
+  # Not `find -mmin`: BSD find rejects a fractional minute outright, so the
+  # check always failed, the cache always rebuilt, and the failed find was paid
+  # on top -- cached runs measured slower than uncached ones.
+  mtime=$(stat -f %m "$HW_BRANCHES" 2>/dev/null) \
+    || mtime=$(stat -c %Y "$HW_BRANCHES" 2>/dev/null) \
+    || return 0
+  now=$(date +%s)
+  (( now - mtime >= HW_BRANCH_TTL ))
+}
+
+# Ask a yes/no through fzf rather than `read`.
+#
+# `read` needs stdin to be a terminal. Inside a herdr popup it is not reliably
+# one, so a `[y/N]` prompt waits for input that never arrives and the popup
+# simply hangs -- which is what removing a worktree with unpushed work did. fzf
+# opens /dev/tty itself, which is why the menus worked where the prompts did
+# not. No is first, and anything other than an explicit yes -- including esc --
+# means no, because every caller asks before doing something it cannot undo.
+confirm() {
+  local question=${1:?} detail=${2:-} pick
+  pick=$(printf '%s\n' "no   leave it alone" "yes  $question" \
+         | _fzf --prompt='confirm > ' --header="${detail:-$question}") || return 1
+  [[ $(awk '{print $1}' <<<"$pick") == "yes" ]]
+}
+
+# Keep a popup open long enough to read the last screen.
+pause() { [[ -t 0 ]] && { printf '\n\033[2m[enter to close]\033[0m'; read -r _; } || true; }
+
+in_herdr() { [[ ${HERDR_ENV:-} == 1 ]]; }
+
+# ---------------------------------------------------------------- helpers ---
+
+slug() {
+  printf '%s' "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' \
+    | cut -c1-48 \
+    | sed -E 's/-+$//'
+}
+
+# Offline branch naming: drop filler words, keep the first few that carry
+# meaning. Used when smart naming is off or unavailable.
+slug_concise() {
+  printf '%s' "${1:-}" \
+    | tr '[:upper:]' '[:lower:]' \
+    | tr -cs 'a-z0-9' '\n' \
+    | grep -vxE '(can|you|your|please|could|would|should|i|we|us|my|me|it|its|the|a|an|and|or|but|for|to|of|in|on|at|as|by|with|so|that|this|these|those|then|than|just|also|need|needs|want|wants|make|makes|making|let|lets|is|are|was|were|be|been|being|will|now|up|out|new|some|any|all|from|into|over|when|where|how|why|what|if|do|does|get|gets|go|goes|like|more|most|very|really)' \
+    | grep -vx '' \
+    | head -4 \
+    | paste -sd- - \
+    | cut -c1-40 \
+    | sed -E 's/-+$//'
+}
+
+# A short, meaningful branch name for a free-text prompt. Asks Claude for a
+# 2-4 word name, since slugging the whole sentence produces things like
+# `eli/can-you-create-new-sessions-for-my-nvim-git-plug`.
+branch_name_for() {
+  local prompt=${1:?} name="" tmp pid waited=0 limit
+  limit=$(( ${HW_NAME_TIMEOUT:-15} * 10 ))
+
+  if [[ ${HW_SMART_BRANCH:-1} == 1 ]] && command -v claude >/dev/null 2>&1; then
+    info "naming the branch…"
+    tmp=$(mktemp)
+    ( claude -p "Task: $prompt
+
+Reply with ONLY a git branch name for this task: 2-4 lowercase words, hyphen-separated. No prefix, no quotes, no explanation." \
+        --model "${HW_NAME_MODEL:-haiku}" >"$tmp" 2>/dev/null ) &
+    pid=$!
+    # No `timeout` binary on macOS, so poll rather than block forever.
+    while kill -0 "$pid" 2>/dev/null && (( waited < limit )); do
+      sleep 0.1; waited=$((waited + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      warn "naming timed out; falling back"
+    else
+      wait "$pid" 2>/dev/null || true
+      name=$(slug "$(tail -1 "$tmp" 2>/dev/null | tr -d '\r')")
+    fi
+    rm -f "$tmp"
+    # Guard against a chatty reply sneaking through.
+    (( ${#name} > 40 )) && name=""
+  fi
+
+  [[ -z $name ]] && name=$(slug_concise "$prompt")
+  [[ -z $name ]] && name=$(slug "$prompt")
+  printf '%s' "$name"
+}
+
+# Repo the caller is standing in, resolved to its main checkout name.
+current_repo_root() { git rev-parse --show-toplevel 2>/dev/null || true; }
+
+current_branch() { git rev-parse --abbrev-ref HEAD 2>/dev/null || true; }
+
+# Project name for a checkout path: the directory under $HW_ROOT.
+project_of() {
+  local p=${1:?} rel
+  rel=${p#"$HW_ROOT"/}
+  [[ $rel == "$p" ]] && { basename "$p"; return; }
+  printf '%s' "${rel%%/*}"
+}
+
+default_branch_of() {
+  local repo=${1:?}
+  gh repo view "$HW_ORG/$repo" --json defaultBranchRef \
+    --jq '.defaultBranchRef.name' 2>/dev/null || echo main
+}
+
+# ------------------------------------------------------------ projects ------
+#
+# A project is a name plus a git source: a bare repo under $HW_ROOT, or any
+# checkout registered in place. Worktrees live at $HW_ROOT/<name>/<slug>, but
+# each one becomes its own flat herdr session.
+
+HW_REGISTRY="${HW_REGISTRY:-$HOME/.config/hw/projects.tsv}"
+
+registry_list() {
+  [[ -r $HW_REGISTRY ]] || return 0
+  grep -v -e '^[[:space:]]*#' -e '^[[:space:]]*$' "$HW_REGISTRY" 2>/dev/null || true
+}
+
+registry_src() {
+  registry_list | awk -F'\t' -v n="${1:?}" '$1 == n { print $2; exit }'
+}
+
+# The git source to drive worktree commands with.
+project_src() {
+  local name=${1:?} src d
+  src=$(registry_src "$name")
+  [[ -n $src && -e $src ]] && { printf '%s' "$src"; return; }
+  [[ -d "$HW_ROOT/$name/.bare" ]] && { printf '%s' "$HW_ROOT/$name/.bare"; return; }
+  for d in "$HW_ROOT/$name"/*/; do
+    [[ -d ${d}.git ]] && { printf '%s' "${d%/}"; return; }
+  done
+  return 1
+}
+
+repo_main() { project_src "$@"; }
+repo_is_bare() { [[ -d "$HW_ROOT/${1:?}/.bare" ]]; }
+
+# A checkout to read files from (env files, setup hooks); a bare repo has none.
+repo_ref() {
+  local repo=${1:?} d src
+  src=$(registry_src "$repo")
+  [[ -n $src && -d $src/.git ]] && { printf '%s' "$src"; return; }
+  [[ -e "$HW_ROOT/$repo/main/.git" ]] && { printf '%s' "$HW_ROOT/$repo/main"; return; }
+  for d in "$HW_ROOT/$repo"/*/; do
+    [[ ${d%/} == */.bare ]] && continue
+    [[ -e ${d}.git ]] && { printf '%s' "${d%/}"; return; }
+  done
+  return 1
+}
+
+# Where "add a folder" looks for git repos.
+HW_SCAN_DIRS="${HW_SCAN_DIRS:-$HOME/Documents $HOME/code $HOME/src $HOME/Developer $HOME/projects $HOME/repos}"
+HW_SCAN_DEPTH="${HW_SCAN_DEPTH:-5}"
+
+# Git repos on disk, excluding anything hw already manages under $HW_ROOT.
+discover_repos() {
+  local roots=() d
+  for d in $HW_SCAN_DIRS; do [[ -d $d ]] && roots+=("$d"); done
+  (( ${#roots[@]} )) || return 0
+  {
+    if command -v fd >/dev/null 2>&1; then
+      fd -H -t d -d "$HW_SCAN_DEPTH" '^\.git$' "${roots[@]}" 2>/dev/null
+    else
+      find "${roots[@]}" -maxdepth "$HW_SCAN_DEPTH" -type d -name .git 2>/dev/null
+    fi
+  } | sed 's|/\.git/*$||' | grep -v "^$HW_ROOT/" | sort -u
+}
+
+# Pick a folder to adopt: browse what is on disk, or type a path.
+pick_folder() {
+  need fzf
+  local pick
+  pick=$(discover_repos \
+    | _fzf --prompt='folder > ' \
+           --header='git repos on disk — esc to type a path instead') || pick=""
+  if [[ -z $pick ]]; then
+    read -r -e -p "path to repo: " pick
+  fi
+  printf '%s' "${pick/#\~/$HOME}"
+}
+
+# Adopt a folder and echo the project name it registered as.
+add_folder_interactive() {
+  local path name
+  path=$(pick_folder)
+  [[ -z $path ]] && return 1
+  cmd_add "$path" >&2 || return 1
+  name=$(basename "$(cd "$path" && git rev-parse --show-toplevel 2>/dev/null || echo "$path")")
+  printf '%s' "$name"
+}
+
+# Register an existing local repo in place. Nothing is moved or re-cloned.
+cmd_add() {
+  local path=${1:-} name root
+  if [[ -z $path ]]; then
+    read -r -p "folder to add as a project: " path
+    [[ -z $path ]] && return 0
+  fi
+  path=${path/#\~/$HOME}
+  [[ -d $path ]] || die "no such directory: $path"
+  path=$(cd "$path" && pwd -P)
+  root=$(git -C "$path" rev-parse --show-toplevel 2>/dev/null) \
+    || die "$path is not a git repository"
+  name=${2:-$(basename "$root")}
+
+  mkdir -p "$(dirname "$HW_REGISTRY")" 
+  if [[ -f $HW_REGISTRY ]] && grep -q "^$name	" "$HW_REGISTRY"; then
+    warn "'$name' already registered; updating its path"
+    grep -v "^$name	" "$HW_REGISTRY" > "$HW_REGISTRY.tmp" || :
+    mv "$HW_REGISTRY.tmp" "$HW_REGISTRY"
+  fi
+  printf '%s\t%s\n' "$name" "$root" >> "$HW_REGISTRY"
+  info "registered '$name' -> $root"
+}
+
+cmd_projects() {
+  { registry_list | awk -F'\t' '{printf "%s\tregistered\t%s\n", $1, $2}'
+    for d in "$HW_ROOT"/*/; do
+      n=$(basename "$d")
+      [[ $n == .hw-trash ]] && continue
+      [[ -n $(registry_src "$n") ]] && continue
+      [[ -d "${d}.bare" ]] && printf '%s\tbare\t%s\n' "$n" "${d}.bare"
+    done
+  } | sort -u | column -t -s$'\t'
+}
+
+
+ensure_repo() {
+  local repo=${1:?} main def bare
+  if main=$(repo_main "$repo"); then printf '%s' "$main"; return; fi
+  need gh
+  def=$(default_branch_of "$repo")
+  bare="$HW_ROOT/$repo/.bare"
+  info "cloning $HW_ORG/$repo -> $HW_ROOT/$repo (bare + $def worktree)"
+  mkdir -p "$HW_ROOT/$repo"
+  gh repo clone "$HW_ORG/$repo" "$bare" -- --bare >&2 || die "clone failed"
+  # A bare clone fetches no remote-tracking refs by default.
+  git --git-dir="$bare" config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
+  git --git-dir="$bare" fetch -q origin >&2 || warn "initial fetch failed"
+  printf 'gitdir: ./.bare\n' > "$HW_ROOT/$repo/.git"
+  git --git-dir="$bare" worktree add "$HW_ROOT/$repo/$def" "$def" >/dev/null 2>&1 \
+    || git --git-dir="$bare" worktree add -b "$def" "$HW_ROOT/$repo/$def" "origin/$def" >/dev/null 2>&1 \
+    || warn "could not create the $def worktree"
+  printf '%s' "$bare"
+}
+
+# ------------------------------------------------------------ worktree ------
+
+# Workspace currently open on a checkout path, if any.
+workspace_for_path() {
+  local p=${1:?} ws
+  ws=$(herdr workspace list 2>/dev/null \
+       | jq -r --arg p "$p" \
+         '.result.workspaces[]? | select(.worktree.checkout_path == $p) | .workspace_id' \
+       | head -1)
+  [[ -n $ws ]] && { printf '%s' "$ws"; return; }
+  # Flat sessions are plain workspaces, so match on the root pane's cwd.
+  herdr pane list 2>/dev/null \
+    | jq -r --arg p "$p" '.result.panes[]? | select(.cwd == $p) | .workspace_id' \
+    | head -1
+}
+
+# Every session hw owns, as "<ws>\t<path>".
+#
+# Keyed on each workspace's ROOT pane, not any pane: a long-lived shell that
+# happens to be cd'd into a worktree must not make its workspace look like
+# that worktree's session.
+hw_sessions() {
+  { herdr workspace list 2>/dev/null \
+      | jq -r '.result.workspaces[]? | select(.worktree != null)
+               | "\(.workspace_id)\t\(.worktree.checkout_path)"'
+    herdr pane list 2>/dev/null \
+      | jq -r --arg r "$HW_ROOT/" '
+          [ .result.panes[]? | select(.cwd != null) ]
+          | group_by(.workspace_id)
+          | map(min_by(.pane_id))
+          | .[] | select(.cwd | startswith($r))
+          | "\(.workspace_id)\t\(.cwd)"'
+  } | sort -u -t$'\t' -k1,1
+}
+
+# Show repo + branch on the session row without relying on herdr worktree info.
+# Mirror the review marker from labels into workspace metadata, where herdr's
+# sidebar renders it in place of the status glyph. Labels survive a restart and
+# tokens do not, so the label stays the source of truth and this re-asserts from
+# it. Takes an already-fetched `workspace list` so a picker pays for only one,
+# and writes only the workspaces that actually drifted.
+# Being under review is a property of the worktree, not of its herdr label.
+# herdr drops workspace metadata on restart and labels are only for display, so
+# the durable record lives here, keyed by checkout path.
+review_mark() {
+  local path=${1:?}
+  # An `if`, not `review_is ... && return`: an AND-list whose first command
+  # fails is exactly the shape that has tripped errexit here before.
+  if review_is "$path"; then return 0; fi
+  printf '%s\n' "$path" >> "$HW_REVIEWS"
+}
+
+review_unmark() {
+  local path=${1:?} tmp
+  [[ -s $HW_REVIEWS ]] || return 0
+  tmp=$(mktemp) || return 0
+  grep -vxF "$path" "$HW_REVIEWS" > "$tmp" 2>/dev/null || true
+  mv "$tmp" "$HW_REVIEWS"
+}
+
+review_is() {
+  local path=${1:?}
+  [[ -s $HW_REVIEWS ]] || return 1
+  grep -qxF "$path" "$HW_REVIEWS" 2>/dev/null
+}
+
+# PR state for the branches you actually have checked out, cached.
+#
+# Listing every open pull request per repo and filtering locally does not scale:
+# asking for 200 PRs with their check rollups returns HTTP 502 on a busy repo.
+# One `gh pr view` per worktree is a small query each, and the count follows how
+# many worktrees you have rather than how busy the repo is. They run in parallel
+# because each is a round trip.
+refresh_pr_cache() {
+  local ws_json=${1:-} tmp line path repo br
+  command -v gh >/dev/null 2>&1 || return 0
+  [[ -z $ws_json ]] && ws_json=$(herdr workspace list 2>/dev/null)
+  tmp=$(mktemp -d) || return 0
+  while IFS=$'\t' read -r path repo; do
+    [[ -z $path || -z $repo || ! -d $path ]] && continue
+    br=$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null) || continue
+    [[ -z $br || $br == HEAD ]] && continue
+    (
+      gh pr view "$br" --repo "$HW_ORG/$repo" \
+         --json headRefName,reviewDecision,mergeStateStatus,isDraft,statusCheckRollup \
+         2>/dev/null \
+        | jq -r --arg r "$repo" --arg b "$br" '
+            select(.headRefName != null)
+            | ([.statusCheckRollup[]? | (.conclusion // .state // "")]) as $checks
+            | (($checks | map(select(. == "FAILURE" or . == "ERROR"
+                                     or . == "TIMED_OUT" or . == "CANCELLED"))
+                        | length) > 0) as $failing
+            # A conflicted branch is as stuck as a failing one, and reads the
+            # same way to whoever has to deal with it.
+            | (if $failing or .mergeStateStatus == "DIRTY" then "blocked"
+               elif .isDraft then "draft"
+               elif .reviewDecision == "APPROVED" then "ready"
+               elif .reviewDecision == "CHANGES_REQUESTED"
+                    or .reviewDecision == "REVIEW_REQUIRED" then "attention"
+               else "" end) as $state
+            | [$r, $b, $state] | @tsv' > "$tmp/$(printf '%s' "$repo-$br" | tr '/' '-')" 2>/dev/null
+    ) &
+  done < <(
+    jq -r '.result.workspaces[]?
+           | select(.worktree != null and .worktree.repo_name != null)
+           | [.worktree.checkout_path, .worktree.repo_name] | @tsv' <<<"$ws_json" 2>/dev/null
+  )
+  wait
+  cat "$tmp"/* 2>/dev/null | grep -v '^$' > "$HW_PRS.new" 2>/dev/null || true
+  mv "$HW_PRS.new" "$HW_PRS" 2>/dev/null || true
+  rm -rf "$tmp"
+}
+
+# Mirror two facts into the sidebar's icon column: a worktree checked out to
+# review someone else's pull request, and a branch that has one of its own.
+# Review wins -- what you are doing with a worktree says more than what its
+# branch has. Both come from local caches, so this never waits on the network.
+#
+# The branch is read from git rather than the $branch token: tokens do not
+# survive a herdr restart, and go stale the moment a worktree changes branch.
+sync_space_markers() {
+  local ws_json=${1:?} ws path repo has br want state pr_state has_state
+  while IFS=$'\t' read -r ws path repo has has_state; do
+    [[ -z $ws ]] && continue
+    [[ $path == "~" ]] && path="" || true
+    [[ $repo == "~" ]] && repo="" || true
+    [[ $has == "~" ]] && has="" || true
+    [[ $has_state == "~" ]] && has_state="" || true
+    want=""; pr_state=""
+    if [[ -n $path ]] && review_is "$path"; then
+      want=$HW_REVIEW_ICON
+    elif [[ -n $path && -d $path && -n $repo && -s $HW_PRS ]]; then
+      br=$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null) || br=""
+      if [[ -n $br ]]; then
+        state=$(awk -F'\t' -v r="$repo" -v b="$br" \
+                  '$1==r && $2==b {print $3; exit}' "$HW_PRS" 2>/dev/null) || state=""
+        if grep -qF "${repo}$(printf '\t')${br}$(printf '\t')" "$HW_PRS" 2>/dev/null; then
+          want=$HW_PR_ICON
+          pr_state=$state
+        fi
+      fi
+    fi
+    [[ $want == "$has" && $pr_state == "$has_state" ]] && continue
+    herdr workspace report-metadata "$ws" --source hw \
+      --token review="$want" --token pr_state="$pr_state" >/dev/null 2>&1 || true
+  done < <(
+    jq -r '.result.workspaces[]?
+           | [ .workspace_id,
+               (.worktree.checkout_path // "~"),
+               (.worktree.repo_name // "~"),
+               (if (.tokens.review // "") == "" then "~" else .tokens.review end),
+               (if (.tokens.pr_state // "") == "" then "~" else .tokens.pr_state end) ]
+           | @tsv' <<<"$ws_json" 2>/dev/null
+  )
+}
+
+report_session_tokens() {
+  local ws=${1:?} path=${2:?} br
+  br=$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null) || br=""
+  [[ -z $br ]] && return 0
+  herdr workspace report-metadata "$ws" --source hw --token branch="$br" >/dev/null 2>&1 || true
+  # Just the branch: herdr groups worktree spaces under their repo, so repeating
+  # the repo here only costs width that the branch name needs.
+  herdr workspace rename "$ws" "$br" >/dev/null 2>&1 || true
+  return 0
+}
+
+# Is a live agent already occupying a pane in this workspace?
+workspace_has_agent() {
+  local ws=${1:?}
+  [[ -n $(herdr agent list 2>/dev/null \
+          | jq -r --arg w "$ws" \
+            '.result.agents[]? | select(.workspace_id == $w) | .pane_id' | head -1) ]]
+}
+
+# Move a path out of the way instead of deleting it. Everything hw discards
+# goes here, so a wrong guess is always recoverable.
+quarantine_path() {
+  local path=${1:?} dest
+  dest="$HW_ROOT/.hw-trash/$(date +%Y%m%d-%H%M%S)-$(basename "$path")"
+  mkdir -p "$(dirname "$dest")"
+  mv "$path" "$dest" || return 1
+  warn "moved aside -> $dest"
+  return 0
+}
+
+# Run a slow job outside this process's session.
+#
+# herdr allows one popup at a time, so anything slow held inside `hw spawn` or
+# `hw close` blocks every other hw command until it finishes. It cannot simply
+# be backgrounded either: closing a pane makes herdr signal that pane's whole
+# session, so a plain `&` job dies with the popup that started it. setsid puts
+# the job in a session of its own, where the sweep cannot reach it.
+detach() {
+  perl -e 'use POSIX qw(setsid); setsid() or die "setsid: $!";
+           exec { $ARGV[0] } @ARGV or die "exec: $!"' \
+    -- "$@" >>"$HW_JOBLOG" 2>&1 </dev/null &
+  disown 2>/dev/null || true
+  return 0
+}
+
+# What a space is busy doing, shown under it in the sidebar while it is. An
+# empty value clears the row.
+job_status() {
+  local ws=${1:-} text=${2:-}
+  [[ -z $ws || $ws == "-" ]] && return 0
+  herdr workspace report-metadata "$ws" --source hw \
+    --token hw_status="$text" >/dev/null 2>&1 || true
+  return 0
+}
+
+# Take a checkout off disk, whatever state it is in, and forget what hw knew
+# about it. The single owner of removal: `hw close` and `hw rm` both route here.
+remove_checkout() {
+  local path=${1:?} proj main st
+  proj=$(project_of "$path")
+  main=$(repo_main "$proj" 2>/dev/null || true)
+  if [[ -n $main ]]; then
+    st=$(worktree_state "$main" "$path")
+    case "$st" in
+      ready)
+        git -C "$main" worktree remove --force "$path" >/dev/null 2>&1 \
+          || quarantine_path "$path" || warn "could not remove $path"
+        ;;
+      orphan|foreign)
+        if [[ -d $path ]]; then
+          quarantine_path "$path" || warn "could not move $path aside"
+        fi
+        ;;
+      stale|absent) ;;
+    esac
+    git -C "$main" worktree prune >/dev/null 2>&1 || true
+  elif [[ -d $path ]]; then
+    quarantine_path "$path" || warn "could not move $path aside"
+  fi
+  # The review record is keyed by this path, so it goes with the worktree.
+  review_unmark "$path"
+  rm -f "$HW_BRANCHES" 2>/dev/null || true
+  return 0
+}
+
+# Detached job: remove the checkout, then close the space it belonged to.
+# Closing it last is deliberate -- it is what used to kill the popup running
+# this work, which is the reason the work moved out here.
+job_teardown() {
+  local path=${1:?} ws=${2:-}
+  printf '%s teardown %s (%s)\n' "$(date +%FT%T)" "$path" "${ws:--}" >&2
+  # However this ends, the space must not be left reporting work nobody is
+  # doing: the row would spin forever with no job behind it.
+  trap 'job_status "$ws" ""' EXIT
+  remove_checkout "$path"
+  if [[ -n $ws && $ws != "-" ]]; then
+    job_status "$ws" ""
+    herdr workspace close "$ws" >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
+# Detached job: run the repo's setup hook in a fresh worktree, then seed the
+# agent. Neither is needed to start using the space, and a dependency install
+# can run for minutes.
+job_setup() {
+  local src=${1:?} path=${2:?} ws=${3:?} pane=${4:-} name=${5:-} prompt=${6:-}
+  printf '%s setup %s (%s)\n' "$(date +%FT%T)" "$path" "$ws" >&2
+  # However this ends, the space must not be left reporting work nobody is
+  # doing: the row would spin forever with no job behind it.
+  trap 'job_status "$ws" ""' EXIT
+  run_setup "$src" "$path" "$ws" || warn "setup failed for $path"
+  if [[ -n $prompt && -n $pane ]] && ! workspace_has_agent "$ws"; then
+    start_agent "$ws" "$pane" "$name" "$prompt"
+  fi
+  job_status "$ws" ""
+  return 0
+}
+
+# Classify the on-disk/git state of a candidate worktree path. Echoes one of:
+#   ready    registered with git and usable
+#   orphan   directory has a .git pointer but git has no admin data for it
+#   foreign  directory exists and is not a git checkout at all
+#   stale    git still lists it but the directory is gone
+#   absent   nothing there
+worktree_state() {
+  local main=${1:?} path=${2:?}
+  local registered=0
+  git -C "$main" worktree list --porcelain 2>/dev/null \
+    | grep -qxF "worktree $path" && registered=1
+
+  if [[ -d $path ]]; then
+    if (( registered )) && git -C "$path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      printf 'ready'; return
+    fi
+    # A .git pointer whose admin data is gone: `git worktree repair` can
+    # sometimes re-link it, so give that a try before calling it an orphan.
+    if [[ -e $path/.git ]]; then
+      git -C "$main" worktree repair "$path" >/dev/null 2>&1 || true
+      if git -C "$path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        info "repaired worktree metadata for $(basename "$path")"
+        printf 'ready'; return
+      fi
+      printf 'orphan'; return
+    fi
+    printf 'foreign'; return
+  fi
+
+  (( registered )) && { printf 'stale'; return; }
+  printf 'absent'
+}
+
+# The branch may already be checked out in a different worktree; git refuses a
+# second checkout, so find where it lives.
+worktree_holding_branch() {
+  local main=${1:?} branch=${2:?}
+  git -C "$main" worktree list --porcelain 2>/dev/null \
+    | awk -v b="refs/heads/$branch" '
+        /^worktree /{ p = substr($0, 10) }
+        $0 == "branch " b { print p; exit }'
+}
+
+# Project name for a registered in-place source path.
+registry_name_for_src() {
+  registry_list | awk -F'\t' -v s="${1:?}" '$2 == s { print $1; exit }'
+}
+
+# create_worktree <git-source> <branch> <base|""> <label-ignored> [prompt]
+#
+# Creates the worktree with git directly, then opens it as a PLAIN herdr
+# workspace. Going through `herdr worktree create` would also open a
+# repo-parent workspace and group every checkout of the repo together; this
+# keeps one flat session per worktree, labelled after the project, with the
+# branch supplied as a metadata token.
+create_worktree() {
+  local src=${1:?} branch=${2:?} base=${3:-} _label=${4:-} prompt=${5:-}
+  local proj name path ws pane st holder out resumed=0
+
+  if [[ $src == "$HW_ROOT"/* ]]; then
+    proj=$(project_of "$src")
+  else
+    proj=$(registry_name_for_src "$src")
+    [[ -n $proj ]] || proj=$(basename "$src")
+  fi
+  name=$(slug "$branch")
+  path="$HW_ROOT/$proj/$name"
+
+  st=$(worktree_state "$src" "$path")
+  ws=$(workspace_for_path "$path")
+
+  if [[ -n $ws && $st != ready ]]; then
+    warn "session $ws points at a $st checkout; closing it"
+    herdr workspace close "$ws" >/dev/null 2>&1 || true
+    ws=""
+  fi
+  if [[ -n $ws ]]; then
+    info "$proj $branch is already open as $ws — focusing"
+    herdr workspace focus "$ws" >/dev/null 2>&1 || true
+    printf '%s\n' "$ws"
+    return 0
+  fi
+
+  case "$st" in
+    ready) resumed=1 ;;
+    stale)
+      info "pruning stale worktree registration for $name"
+      git -C "$src" worktree prune 2>/dev/null || true
+      ;;
+    orphan)
+      warn "$proj/$name has lost its git metadata; quarantining it"
+      quarantine_path "$path" || die "could not move $path aside"
+      git -C "$src" worktree prune 2>/dev/null || true
+      ;;
+    foreign)
+      if [[ -z $(ls -A "$path" 2>/dev/null) ]]; then
+        rmdir "$path" 2>/dev/null || true
+      else
+        die "$path exists and is not a git checkout. Move or remove it, then retry."
+      fi
+      ;;
+  esac
+
+  if (( ! resumed )); then
+    holder=$(worktree_holding_branch "$src" "$branch")
+    if [[ -n $holder && $holder != "$path" && -d $holder ]]; then
+      warn "$branch is already checked out at $holder"
+      path="$holder"; resumed=1
+    elif [[ -n $holder ]]; then
+      git -C "$src" worktree prune 2>/dev/null || true
+    fi
+  fi
+
+  if (( resumed )); then
+    info "reopening existing worktree $proj/$name"
+  else
+    info "creating worktree $proj/$name on $branch"
+    mkdir -p "$(dirname "$path")"
+    if git -C "$src" show-ref --verify --quiet "refs/heads/$branch"; then
+      git -C "$src" worktree add "$path" "$branch" >/dev/null 2>&1 \
+        || die "git worktree add failed for $branch"
+    elif git -C "$src" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+      git -C "$src" worktree add --track -b "$branch" "$path" "origin/$branch" >/dev/null 2>&1 \
+        || die "git worktree add failed for origin/$branch"
+    else
+      git -C "$src" worktree add -b "$branch" "$path" "${base:-HEAD}" >/dev/null 2>&1 \
+        || die "git worktree add failed for new branch $branch"
+    fi
+  fi
+
+  # A plain workspace: no repo parent, no grouping. Label is the project.
+  local wt_branch
+  wt_branch=$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null) || wt_branch="$branch"
+  [[ -z $wt_branch || $wt_branch == HEAD ]] && wt_branch="$branch"
+
+  # `worktree open` (not `workspace create`) so herdr records repo_key and
+  # groups every worktree of a repo in the sidebar. For a bare-layout project
+  # this also opens a parent workspace on .bare, which is the group header;
+  # normalize_main_label relabels it from ".bare" to the project name.
+  out=$(herdr worktree open --cwd "$src" --path "$path" \
+          --label "$proj  $wt_branch" --focus) \
+    || die "could not open a session at $path"
+  ws=$(jq -r '.result.workspace.workspace_id' <<<"$out")
+  pane=$(jq -r '.result.root_pane.pane_id' <<<"$out")
+  [[ -z $ws || $ws == null ]] && die "could not read workspace id from herdr response"
+
+  # The group header workspace opens labelled ".bare"; name it after the project.
+  normalize_main_label "$src"
+
+  report_session_tokens "$ws" "$path"
+  herdr workspace rename "$ws" "$wt_branch" >/dev/null 2>&1 || true
+  rm -f "$HW_BRANCHES" 2>/dev/null || true
+
+  if (( resumed )); then
+    info "resumed $proj/$name as $ws (setup hooks skipped)"
+    if [[ -n $prompt ]] && ! workspace_has_agent "$ws"; then
+      start_agent "$ws" "$pane" "$name" "$prompt"
+    fi
+  else
+    # The space is open and usable now. The setup hook and the agent follow in
+    # their own session so this command -- and the popup running it -- can end,
+    # with the sidebar carrying the progress instead.
+    info "setting up $proj/$name in the background"
+    job_status "$ws" "spinning up"
+    detach "$HW_SELF" __setup "$src" "$path" "$ws" "$pane" "$name" "$prompt"
+  fi
+
+  printf '%s\n' "$ws"
+}
+
+# herdr opens a parent workspace on the source it was handed and treats it as
+# the group owner: closing it demands `--group` while any linked worktree
+# workspace is open. With the bare layout that owner is `.bare` rather than a
+# real checkout, which is the point — `main` becomes an ordinary child you can
+# close on its own. Label the parent after the project instead of ".bare".
+normalize_main_label() {
+  local main=${1:?} proj ws label
+  proj=$(project_of "$main")
+  label=$(basename "$main")
+  [[ $proj == "$label" ]] && return 0
+  ws=$(herdr workspace list 2>/dev/null \
+       | jq -r --arg p "$main" --arg l "$label" \
+         '.result.workspaces[]? | select(.worktree.checkout_path == $p and .label == $l)
+          | .workspace_id' | head -1)
+  [[ -n $ws ]] && herdr workspace rename "$ws" "$proj" >/dev/null 2>&1 || true
+  return 0
+}
+
+# Orca's `--setup run` equivalent: copy ignored env files, then run the repo hook.
+run_setup() {
+  local main=${1:?} path=${2:?} ws=${3:?} f n=0
+  # $main may be a bare repo, which has no files to copy from.
+  main=$(repo_ref "$(project_of "$main")" 2>/dev/null) || return 0
+  [[ -n $main ]] || return 0
+
+  # Untracked-but-ignored .env files never come along with a new worktree.
+  while IFS= read -r f; do
+    [[ -z $f ]] && continue
+    mkdir -p "$path/$(dirname "$f")"
+    cp "$main/$f" "$path/$f" 2>/dev/null && n=$((n+1))
+  done < <(
+    git -C "$main" ls-files --others --ignored --exclude-standard \
+      -- ':(glob)**/.env*' ':(exclude)**/node_modules/**' ':(exclude)**/.git/**' 2>/dev/null | head -50
+  )
+  (( n > 0 )) && info "copied $n env file(s) into the worktree"
+
+  if [[ -x $main/.herdr/setup.sh ]]; then
+    info "running .herdr/setup.sh"
+    # Hook output goes to stderr so it cannot pollute a captured workspace id.
+    ( cd "$path" && HW_WORKTREE="$path" HW_MAIN="$main" ./.herdr/setup.sh >&2 ) \
+      || warn "setup.sh exited non-zero"
+  fi
+  return 0
+}
+
+start_agent() {
+  local ws=${1:?} pane=${2:?} name=${3:?} prompt=${4:?} agent
+  agent=$(printf '%s' "hw-$name" | cut -c1-32 | sed -E 's/[^a-z0-9_-]/-/g; s/^[^a-z]/a/')
+  info "starting $HW_AGENT in $pane"
+  if herdr agent start "$agent" --kind "$HW_AGENT" --pane "$pane" >/dev/null 2>&1; then
+    herdr agent prompt "$agent" "$prompt" >/dev/null 2>&1 \
+      || warn "agent started but the prompt did not submit"
+    # `hw-<branch>` is only an address, and nothing needs it once the prompt is
+    # in. Displayed it crowds the row and repeats the space it sits in, so drop
+    # it and let the agent fall back to its kind. Cleared rather than renamed to
+    # "claude": herdr requires agent names to be unique, so only one could
+    # carry it.
+    herdr agent rename "$agent" --clear >/dev/null 2>&1 || true
+  else
+    warn "could not start $HW_AGENT in $pane; the worktree is ready, start it yourself"
+  fi
+}
+
+# Always pick the project explicitly. Deliberately NOT cwd-aware: you should be
+# able to spin up any branch of any repo from anywhere.
+pick_project_main() {
+  local repo
+  repo=$(pick_repo) || return 1
+  ensure_repo "$repo"
+}
+
+pick_repo() {
+  need fzf
+  local cache="$HW_CACHE/repos.txt" pick resolved
+
+  if command -v gh >/dev/null 2>&1; then
+    if [[ ! -s $cache ]] || [[ $(find "$cache" -mmin +720 2>/dev/null) ]]; then
+      gh repo list "$HW_ORG" --limit 200 --json name,description \
+        --jq '.[]|"\(.name)\t\(.description//"")"' >"$cache" 2>/dev/null || true
+    fi
+  fi
+
+  # Names that already resolve locally, computed ONCE. Calling project_src per
+  # cache line meant ~120 subshells and made the picker take seconds.
+  resolved=$(
+    registry_list | cut -f1
+    for d in "$HW_ROOT"/*/; do
+      [[ -d $d ]] || continue
+      n=$(basename "$d")
+      [[ $n == .hw-trash ]] && continue
+      if [[ -d "${d}.bare" ]]; then
+        printf '%s\n' "$n"
+      else
+        for c in "$d"*/; do
+          [[ -d "${c}.git" ]] && { printf '%s\n' "$n"; break; }
+        done
+      fi
+    done
+  )
+
+  pick=$(
+    {
+      printf '＋ %-26s %s\n' "add a folder…" "adopt a repo from disk"
+      # No trailing column on ◆/● rows. Every name is padded to the same width,
+      # so line length is decided by what follows it — and a registered row
+      # carrying a 40-char path always lost fzf's default `length` tiebreak to
+      # a short remote name. With nothing after the name these rows are the
+      # shortest, so length favours them and index (emission order) settles
+      # any tie. The marker already says which kind each one is.
+      registry_list | awk -F'\t' '{printf "◆ %-26s\n", $1}'
+      printf '%s\n' "$resolved" | awk -v reg="$(registry_list | cut -f1 | paste -sd, -)" '
+        BEGIN { n = split(reg, r, ","); for (i = 1; i <= n; i++) isreg[r[i]] = 1 }
+        $0 != "" && !isreg[$0] && !seen[$0]++ { printf "● %-26s\n", $0 }'
+      # One awk pass over the org list, skipping anything already shown.
+      [[ -s $cache ]] && awk -F'\t' '
+        NR == FNR { if ($0 != "") have[$0] = 1; next }
+        !($1 in have) { printf "○ %-26s %s\n", $1, $2 }' \
+        <(printf '%s\n' "$resolved") "$cache"
+    } | _fzf --prompt='project > ' --header='◆ registered   ● local   ○ remote'
+  ) || return 1
+  [[ $pick == ＋* ]] && { printf '+add'; return 0; }
+  awk '{print $2}' <<<"$pick"
+}
+
+# --------------------------------------------------------------- linear -----
+
+linear_token() {
+  security find-generic-password -s "$HW_LINEAR_SERVICE" -w 2>/dev/null \
+    || die "no Linear token stored. Run:  hw linear-auth"
+}
+
+# Store (or replace) the Linear personal API key in the macOS keychain.
+cmd_linear_auth() {
+  local key verify
+  if security find-generic-password -s "$HW_LINEAR_SERVICE" -w >/dev/null 2>&1; then
+    confirm "replace it" "a Linear key is already stored" \
+      || { info "unchanged"; return 0; }
+    security delete-generic-password -s "$HW_LINEAR_SERVICE" >/dev/null 2>&1 || true
+  fi
+
+  printf 'Create a personal API key at https://linear.app/settings/api\n' >&2
+  printf 'It starts with lin_api_ and is not echoed below.\n' >&2
+  read -r -s -p "Linear API key: " key; printf '\n' >&2
+  [[ -z $key ]] && die "no key entered"
+  [[ $key == lin_api_* ]] || warn "that does not look like a personal API key (expected lin_api_…)"
+
+  security add-generic-password -s "$HW_LINEAR_SERVICE" -a "$USER" -w "$key" \
+    || die "could not write to the keychain"
+
+  info "verifying…"
+  verify=$(curl -sS https://api.linear.app/graphql \
+    -H "Authorization: $key" -H 'Content-Type: application/json' \
+    --data '{"query":"{ viewer { name email } }"}' 2>/dev/null)
+  if jq -e '.data.viewer.email' >/dev/null 2>&1 <<<"$verify"; then
+    info "authenticated as $(jq -r '.data.viewer.name + " <" + .data.viewer.email + ">"' <<<"$verify")"
+  else
+    warn "stored, but the key did not verify: $(jq -r '.errors[0].message // "unknown error"' <<<"$verify" 2>/dev/null)"
+  fi
+}
+
+linear_gql() {
+  local query=${1:?} token
+  token=$(linear_token)
+  curl -sS https://api.linear.app/graphql \
+    -H "Authorization: $token" \
+    -H 'Content-Type: application/json' \
+    --data "$(jq -nc --arg q "$query" '{query:$q}')"
+}
+
+# ----------------------------------------------------------- subcommands ----
+
+cmd_proj() {
+  local repo main ws
+  repo=$(pick_repo) || return 0
+  main=$(ensure_repo "$repo")
+
+  # Reuse an open workspace pointing at this checkout.
+  ws=$(herdr workspace list 2>/dev/null \
+       | jq -r --arg p "$main" '.result.workspaces[]?
+           | select(.worktree.checkout_path == $p) | .workspace_id' | head -1)
+  if [[ -n $ws ]]; then
+    info "focusing existing workspace $ws"
+    herdr workspace focus "$ws" >/dev/null
+  else
+    herdr workspace create --cwd "$main" --label "$repo" --focus >/dev/null
+  fi
+}
+
+cmd_new() {
+  local prompt="$*" main branch
+  if [[ -z $prompt ]]; then
+    read -r -p "what are you working on? " prompt
+    [[ -z $prompt ]] && return 0
+  fi
+  main=$(pick_project_main) || return 0
+  branch="${HW_BRANCH_PREFIX}$(branch_name_for "$prompt")"
+  create_worktree "$main" "$branch" "$(git -C "$main" rev-parse --abbrev-ref HEAD)" \
+    "$(printf '%.50s' "$prompt")" "$prompt" >/dev/null
+}
+
+cmd_branch() {
+  need fzf
+  local main pick branch base
+  main=${1:-$(pick_project_main)} || return 0
+  [[ -z $main ]] && return 0
+
+  if git -C "$main" remote get-url origin >/dev/null 2>&1; then
+    info "fetching refs"
+    git -C "$main" fetch --prune --quiet origin || warn "fetch failed; using cached refs"
+  fi
+
+  # One column: the branch name. The old rows carried the name twice plus the
+  # commit subject and PR title, so fuzzy matching scored against all of it and
+  # unrelated branches surfaced. A PR's head branch is also a remote branch, so
+  # refs/remotes/origin already covers them without a `gh pr list` round-trip.
+  pick=$(
+    {
+      git -C "$main" for-each-ref --sort=-committerdate --count=200 \
+        --format='%(refname:lstrip=3)' refs/remotes/origin
+      git -C "$main" for-each-ref --sort=-committerdate --count=200 \
+        --format='%(refname:lstrip=2)' refs/heads
+    } | grep -vx 'HEAD' | awk 'NF && !seen[$0]++' \
+      | _fzf --prompt='branch > '
+  ) || return 0
+
+  branch=$pick
+  [[ -z $branch || $branch == HEAD ]] && return 0
+
+  # A branch that exists only on the remote has to be created locally as a
+  # tracking branch first. Passing herdr `--branch <name>` with no local ref
+  # forks it from the main checkout's HEAD instead — you get the right branch
+  # name pointing at the wrong commit, with no upstream.
+  if git -C "$main" show-ref --verify --quiet "refs/heads/$branch"; then
+    base=""
+    git -C "$main" rev-parse --abbrev-ref "$branch@{u}" >/dev/null 2>&1 \
+      || git -C "$main" branch --set-upstream-to "origin/$branch" "$branch" >/dev/null 2>&1 \
+      || true
+  elif git -C "$main" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+    info "creating local branch tracking origin/$branch"
+    git -C "$main" branch --track "$branch" "origin/$branch" >/dev/null 2>&1 \
+      || warn "could not create tracking branch for $branch"
+    base=""
+  else
+    base=$(git -C "$main" rev-parse --abbrev-ref HEAD)
+  fi
+  create_worktree "$main" "$branch" "$base" "$branch" >/dev/null
+}
+
+cmd_linear() {
+  need fzf; need curl
+  local src=${1:-} resp pick id branch title desc url main prompt
+  info "loading your Linear issues"
+  resp=$(linear_gql '
+    query {
+      viewer {
+        assignedIssues(
+          first: 60
+          filter: { state: { type: { nin: ["completed","canceled"] } } }
+          orderBy: updatedAt
+        ) {
+          nodes { identifier title branchName url description
+                  state { name } priorityLabel
+                  team { key } }
+        }
+      }
+    }')
+
+  if jq -e '.errors' <<<"$resp" >/dev/null 2>&1; then
+    die "Linear API error: $(jq -r '.errors[0].message' <<<"$resp")"
+  fi
+
+  pick=$(jq -r '.data.viewer.assignedIssues.nodes[]
+           | "\(.identifier)\t\(.state.name)\t\(.title)"' <<<"$resp" \
+         | column -t -s$'\t' \
+         | _fzf --prompt='ticket > ') || return 0
+
+  id=$(awk '{print $1}' <<<"$pick")
+  [[ -z $id ]] && return 0
+
+  branch=$(jq -r --arg i "$id" '.data.viewer.assignedIssues.nodes[]|select(.identifier==$i)|.branchName' <<<"$resp")
+  title=$(jq -r --arg i "$id"  '.data.viewer.assignedIssues.nodes[]|select(.identifier==$i)|.title' <<<"$resp")
+  desc=$(jq -r --arg i "$id"   '.data.viewer.assignedIssues.nodes[]|select(.identifier==$i)|.description//""' <<<"$resp")
+  url=$(jq -r --arg i "$id"    '.data.viewer.assignedIssues.nodes[]|select(.identifier==$i)|.url' <<<"$resp")
+
+  main=${src:-$(pick_project_main)} || return 0
+  prompt="Work on Linear ticket ${id}: ${title}
+
+${desc}
+
+Ticket: ${url}"
+
+  create_worktree "$main" "$branch" "$(git -C "$main" rev-parse --abbrev-ref HEAD)" \
+    "$id $title" "$prompt" >/dev/null
+}
+
+cmd_ci() {
+  need gh; need fzf
+  local br pick id
+  br=$(current_branch) || die "not in a git repo"
+  [[ -z $br ]] && die "not in a git repo"
+
+  pick=$(gh run list --branch "$br" --limit 20 \
+           --json databaseId,status,conclusion,workflowName,headSha,createdAt \
+           --jq '.[]|"\(.databaseId)\t\(.conclusion // .status)\t\(.workflowName)\t\(.createdAt[0:16])"' 2>/dev/null \
+         | column -t -s$'\t' \
+         | _fzf --prompt="ci ($br) > ") || return 0
+
+  id=$(awk '{print $1}' <<<"$pick")
+  [[ -z $id ]] && return 0
+
+  # Failed steps first; fall back to the run summary for a green run.
+  if ! gh run view "$id" --log-failed 2>/dev/null | ${PAGER:-less -R}; then
+    gh run view "$id" | ${PAGER:-less -R}
+  fi
+}
+
+cmd_pr() {
+  need gh
+  local br
+  br=$(current_branch) || die "not in a git repo"
+  {
+    printf '\033[1m── checks ─────────────────────────────\033[0m\n'
+    gh pr checks 2>&1 || true
+    printf '\n\033[1m── pr ─────────────────────────────────\033[0m\n'
+    gh pr view --comments 2>&1 || echo "no PR open for $br"
+  } | ${PAGER:-less -R}
+}
+
+cmd_rm() {
+  need fzf
+  local pick path ws
+  # Drive the picker off workspace list (works from any cwd) unioned with the
+  # worktrees git knows about, so entries in any half-broken state still show.
+  pick=$(
+    {
+      herdr workspace list 2>/dev/null \
+        | jq -r '.result.workspaces[]?
+                 | select(.worktree != null and .worktree.is_linked_worktree)
+                 | "\(.worktree.checkout_path)\t\(.workspace_id)"'
+      for m in "$HW_ROOT"/*/*/; do
+        [[ -d ${m}.git ]] || continue
+        git -C "$m" worktree list --porcelain 2>/dev/null \
+          | awk '/^worktree /{print substr($0,10) "\t-"}'
+      done
+    } | sort -u -t$'\t' -k1,1 \
+      | while IFS=$'\t' read -r pp ww; do
+          [[ -z $pp ]] && continue
+          # Never offer a project's canonical checkout for removal.
+          [[ -d $pp/.git ]] && continue
+          printf '%s\t%s\t%s\n' "$pp" "$ww" \
+            "$(git -C "$pp" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '(broken)')"
+        done \
+      | column -t -s$'\t' \
+      | _fzf --prompt='remove worktree > '
+  ) || return 0
+
+  path=$(awk '{print $1}' <<<"$pick")
+  ws=$(awk '{print $2}' <<<"$pick")
+  [[ -z $path ]] && return 0
+
+  confirm "remove it" "$path" || return 0
+
+  [[ -z $ws || $ws == "-" ]] && ws=$(workspace_for_path "$path")
+  info "removing $path in the background"
+  job_status "$ws" "tearing down"
+  detach "$HW_SELF" __teardown "$path" "$ws"
+}
+
+# Close one session, and decide separately whether the worktree goes with it.
+# herdr's own remove_worktree acts on the repo, so it drags in every session
+# sharing that repo; this acts on a single workspace.
+# Checkout a session is sitting in. Flat sessions have no herdr worktree
+# record, so fall back to the root pane's cwd.
+workspace_path() {
+  local ws=${1:?} p
+  p=$(herdr workspace get "$ws" 2>/dev/null \
+      | jq -r '.result.workspace.worktree.checkout_path // ""')
+  [[ -n $p && $p != null ]] && { printf '%s' "$p"; return; }
+  herdr pane list 2>/dev/null \
+    | jq -r --arg w "$ws" '.result.panes[]? | select(.workspace_id == $w) | .cwd' | head -1
+}
+
+# A linked worktree keeps .git as a FILE; a repo's own working tree has a dir.
+is_linked_worktree() { [[ -f "${1:?}/.git" ]]; }
+
+cmd_close() {
+  local ws=${1:-$(here_workspace)} js path linked label
+  local dirty=0 unpushed=0 note="" choice
+
+  [[ -z $ws ]] && die "no workspace: run inside a herdr pane or pass a workspace id"
+  js=$(herdr workspace get "$ws" 2>/dev/null) || die "no such workspace: $ws"
+
+  label=$(jq -r '.result.workspace.label // .result.workspace.workspace_id' <<<"$js")
+  path=$(workspace_path "$ws")
+  linked=false
+  [[ -n $path ]] && is_linked_worktree "$path" && linked=true
+
+  # Nothing on disk to reason about: just close it.
+  if [[ -z $path || $path == null || ! -d $path ]]; then
+    herdr workspace close "$ws" >/dev/null 2>&1 && info "closed $label ($ws)"
+    return 0
+  fi
+
+  # Guard both: `pipefail` turns a failing git inside a pipeline into a fatal
+  # script exit, and `@{u}` fails outright on a branch with no upstream.
+  if [[ -d $path ]]; then
+    dirty=$(git -C "$path" status --porcelain 2>/dev/null | wc -l | tr -d ' ') || dirty=0
+    if git -C "$path" rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1; then
+      unpushed=$(git -C "$path" log --oneline '@{u}..' 2>/dev/null | wc -l | tr -d ' ') || unpushed=0
+    fi
+  fi
+  [[ -z $dirty ]] && dirty=0
+  [[ -z $unpushed ]] && unpushed=0
+  (( dirty ))    && note+="  ${dirty} uncommitted"
+  (( unpushed )) && note+="  ${unpushed} unpushed"
+
+  # The project's canonical checkout backs every linked worktree of the repo.
+  # Removing it would take them all, so it is never offered here.
+  if [[ $linked != true ]]; then
+    herdr workspace close "$ws" >/dev/null 2>&1 \
+      && info "closed $label ($ws); main checkout left on disk"
+    return 0
+  fi
+
+  need fzf
+  choice=$(printf '%s\n' \
+    "keep    close the session, leave the worktree so you can reopen it" \
+    "remove  close the session and remove the worktree${note:+ —$note}" \
+    "cancel  do nothing" \
+    | _fzf --prompt="close ${label} > " \
+           --header="$(basename "$path")${note:+ —$note}") || return 0
+  choice=$(awk '{print $1}' <<<"$choice")
+
+  case "$choice" in
+    keep)
+      info "closing $label; worktree kept at $path"
+      # Closing this workspace tears down the popup running this command, so it
+      # goes last and goes synchronously. Backgrounding it behind a sleep raced
+      # the teardown: the server never saw the request and the space survived.
+      herdr workspace close "$ws" >/dev/null 2>&1 || true
+      ;;
+    remove)
+      if (( dirty || unpushed )); then
+        confirm "remove it anyway" "$(basename "$path") has${note}" \
+          || { info "cancelled"; return 0; }
+      fi
+      info "removing $label in the background"
+      job_status "$ws" "tearing down"
+      detach "$HW_SELF" __teardown "$path" "$ws"
+      ;;
+    *) return 0 ;;
+  esac
+}
+
+# Focus a space, and optionally an agent pane inside it.
+#
+# These pickers run in a session-modal popup. A focus applied while the popup
+# is still up gets reverted by the client when the popup closes — pane moves
+# inside the current space survive, a space change does not. So apply it now
+# (correct when run from a plain shell) and again just after we exit.
+focus_target() {
+  local ws=${1:?} pane=${2:-}
+  herdr workspace focus "$ws" >/dev/null 2>&1 || true
+  [[ -n $pane ]] && herdr agent focus "$pane" >/dev/null 2>&1 || true
+
+  # Ignore HUP so closing the popup does not kill the pending re-focus.
+  ( trap '' HUP
+    sleep "${HW_FOCUS_DELAY:-0.35}"
+    herdr workspace focus "$ws" >/dev/null 2>&1
+    [[ -n $pane ]] && herdr agent focus "$pane" >/dev/null 2>&1
+  ) >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+  return 0
+}
+
+# Which space/pane the picker was invoked from. A popup is its own pane, so
+# HERDR_PANE_ID cannot identify the pane you came from; the workspace id still
+# can, because the popup belongs to the current space.
+here_workspace() {
+  local ws=${HERDR_WORKSPACE_ID:-}
+  [[ -n $ws ]] && { printf '%s' "$ws"; return; }
+  herdr workspace list 2>/dev/null \
+    | jq -r '.result.workspaces[]? | select(.focused) | .workspace_id' | head -1
+}
+
+# One-line breadcrumb so popup context can be inspected after the fact. Off by
+# default: it costs three `herdr` round-trips on a picker that has to feel
+# instant. Turn it on for a run with `HW_DEBUG=1 hw reviews`.
+hw_debug_env() {
+  [[ ${HW_DEBUG:-0} == 1 ]] || return 0
+  printf '%s\t%s\tenv_ws=%s\tenv_pane=%s\tfocused_pane=%s\tfocused_ws=%s\tfocused_agent=%s\n' \
+    "$(date +%H:%M:%S)" "${1:-?}" "${HERDR_WORKSPACE_ID:-}" "${HERDR_PANE_ID:-}" \
+    "$(herdr pane list 2>/dev/null | jq -r '[.result.panes[]?|select(.focused)|.pane_id]|join(",")')" \
+    "$(herdr workspace list 2>/dev/null | jq -r '[.result.workspaces[]?|select(.focused)|.workspace_id]|join(",")')" \
+    "$(herdr agent list 2>/dev/null | jq -r '[.result.agents[]?|select(.focused)|.pane_id]|join(",")')" \
+    >> "$HW_CACHE/context.log" 2>/dev/null || true
+}
+
+# A popup picker over spaces only. herdr's own `workspace_picker` is a sidebar
+# highlight rather than an overlay, and its `goto` picker spans panes too.
+# Shorten a path for display: strip $HW_ROOT (the repo column already names
+# the project), otherwise abbreviate $HOME to ~.
+pretty_path() {
+  local p=${1:-}
+  [[ -z $p ]] && { printf '%s' "-"; return; }
+  if [[ $p == "$HW_ROOT"/* ]]; then
+    printf '%s' "${p#"$HW_ROOT"/}"
+  else
+    printf '%s' "~${p#$HOME}"
+  fi
+}
+
+cmd_spaces() {
+  need fzf
+  local rows pick ws cur idx panes ws_json branches
+
+  cur=$(here_workspace)
+  ws_json=$(herdr workspace list 2>/dev/null)
+  branches=$(branch_map "$ws_json")
+  # Root-pane cwd per workspace, fetched once: a space with no worktree (a
+  # plain shell) still has a path worth showing.
+  panes=$(herdr pane list 2>/dev/null \
+    | jq -r '[.result.panes[]? | select(.cwd != null)]
+             | group_by(.workspace_id) | map(min_by(.pane_id))
+             | .[] | "\(.workspace_id)\t\(.cwd)"')
+
+  rows=$(
+    printf '%s' "$ws_json" \
+      | jq -r --arg cur "$cur" --arg branches "$branches" '
+          # path -> branch, resolved once by git for every worktree at once.
+          ($branches | split("\n") | map(select(length > 0) | split("\t"))
+                     | map({(.[0]): .[1]}) | add // {}) as $branch_at
+          # U+25D0 is missing from common terminal fonts and falls back to
+          # another face, so a filled circle stands in for "working".
+          | def icon:
+            if   . == "working" then "\u25cf"
+            elif . == "blocked" then "\u00d7"
+            elif . == "done"    then "\u2713"
+            elif . == "idle"    then "\u25cb"
+            else "\u00b7" end;
+          [.result.workspaces[]?] as $all
+          # Match the sidebar: spaces of one repo stay together, repos appear in
+          # the order herdr holds them, and a repo is anchored by where its
+          # first space falls -- not alphabetically, which interleaves them.
+          | ( [ $all | to_entries[]
+                | {k: (.value.worktree.repo_key // ("ws:" + .value.workspace_id)), i: .key} ]
+              | group_by(.k)
+              | map({(.[0].k): (map(.i) | min)})
+              | add // {} ) as $group_at
+          | [ $all | to_entries[]
+              | .key as $i | .value as $w
+              | ($w.worktree.repo_key // ("ws:" + $w.workspace_id)) as $k
+              | { w: $w, i: $i, g: ($group_at[$k] // $i),
+                  parent: (if ($w.worktree != null)
+                             and ($w.worktree.is_linked_worktree | not)
+                           then 0 else 1 end) } ]
+          | sort_by([.g, .parent, .i])
+          | .[].w
+          # A repo parent is the group header, not somewhere work happens: a
+          # bare repo has no working files at all, and a main checkout is only
+          # reached deliberately. Spaces with no worktree are real and stay.
+          | select(.worktree == null or .worktree.is_linked_worktree == true)
+          | [ .workspace_id,
+              (if .workspace_id == $cur then "*"
+               else ((.agent_status // "") | icon) end),
+              # Placeholders, not empty strings: read with IFS=tab collapses
+              # consecutive tabs, which would shift every later column left.
+              (.worktree.repo_name // "~"),
+              # git first: the $branch token goes stale the moment a worktree
+              # moves to another branch, and it does not survive a restart.
+              (($branch_at[.worktree.checkout_path // ""] // .tokens.branch // "")
+               | if . == "" then "~" else . end),
+              (.worktree.checkout_path // "~"),
+              (.label // .workspace_id),
+              # The marker hw already mirrors into metadata, so the picker and
+              # the sidebar cannot disagree about what a space is.
+              (if (.tokens.review // "") == "" then "~" else .tokens.review end)
+            ] | @tsv' \
+      | while IFS=$'\t' read -r id mark repo br path label rev; do
+          [[ $br == "~" ]] && br="" || true
+          [[ $repo == "~" ]] && repo="" || true
+          [[ $path == "~" ]] && path="" || true
+          # No worktree record: fall back to the root pane's cwd.
+          [[ -z $path ]] && path=$(awk -F'\t' -v w="$id" '$1==w{print $2; exit}' <<<"$panes") || true
+          [[ -z $repo ]] && repo=$label || true
+          # A marked space shows its marker in place of the status glyph, the
+          # same way the sidebar does: a pencil for a worktree you are reviewing
+          # in, a pull-request mark for a branch that has one open.
+          if [[ $mark != "*" && $rev != "~" && -n $rev ]]; then
+            mark=$rev
+          fi
+          printf '%s\t%s\t%s\t%s\t%s\n' \
+            "$id" "$mark" "$repo" "${br:--}" "$(pretty_path "$path")"
+        done \
+      | column -t -s$'\t'
+  )
+  [[ -z $rows ]] && { warn "no spaces open"; return 0; }
+
+  # grep exits 1 when the current space is not in this list (always true for
+  # the reviews picker unless you are already in a review). With pipefail that
+  # fails the assignment, and set -e would abort before the fallback below.
+  idx=$(printf '%s\n' "$rows" | grep -n "^${cur}[[:space:]]" | head -1 | cut -d: -f1) || idx=""
+  [[ -z $idx ]] && idx=1 || true
+
+  export HW_FZF_HOME=$idx
+  pick=$(printf '%s\n' "$rows" \
+    | _fzf --prompt='space > ' --with-nth=2.. --bind "load:pos($idx)" \
+           --header='* current   ○ idle   ◐ working   ● needs attention   ✓ done') || return 0
+
+  ws=$(awk '{print $1}' <<<"$pick")
+  [[ -z $ws ]] && return 0
+  focus_target "$ws"
+}
+
+# A popup picker over PR-review spaces only. They stay in their repo groups in
+# herdr; this is the cross-repo view of everything under review.
+cmd_reviews() {
+  need fzf
+  local rows pick ws cur idx panes ws_json rev_paths branches
+
+  hw_debug_env reviews
+  cur=$(here_workspace)
+  ws_json=$(herdr workspace list 2>/dev/null)
+  branches=$(branch_map "$ws_json")
+  rev_paths=$(cat "$HW_REVIEWS" 2>/dev/null) || rev_paths=""
+  panes=$(herdr pane list 2>/dev/null \
+    | jq -r '[.result.panes[]? | select(.cwd != null)]
+             | group_by(.workspace_id) | map(min_by(.pane_id))
+             | .[] | "\(.workspace_id)\t\(.cwd)"')
+
+  rows=$(
+    printf '%s' "$ws_json" \
+      | jq -r --arg cur "$cur" --arg branches "$branches" --arg paths "$rev_paths" '
+          ($paths | split("\n") | map(select(length > 0))) as $reviews
+          | ($branches | split("\n") | map(select(length > 0) | split("\t"))
+                       | map({(.[0]): .[1]}) | add // {}) as $branch_at
+          | def icon:
+            if   . == "working" then "\u25cf"
+            elif . == "blocked" then "\u25cf"
+            elif . == "done"    then "\u2713"
+            elif . == "idle"    then "\u25cb"
+            else "\u00b7" end;
+          .result.workspaces[]?
+          | (.worktree.checkout_path // "") as $p
+          | select(($reviews | index($p)) != null)
+          | [ .workspace_id,
+              (if .workspace_id == $cur then "*"
+               else ((.agent_status // "") | icon) end),
+              (.worktree.repo_name // "~"),
+              (.worktree.checkout_path // "~"),
+              (($branch_at[.worktree.checkout_path // ""] // "")
+               | if . == "" then "~" else . end)
+            ] | @tsv' \
+      | while IFS=$'\t' read -r id mark repo path br; do
+          [[ $repo == "~" ]] && repo="" || true
+          [[ $path == "~" ]] && path="" || true
+          [[ $br == "~" ]] && br="" || true
+          [[ -z $path ]] && path=$(awk -F'\t' -v w="$id" '$1==w{print $2; exit}' <<<"$panes") || true
+          [[ -z $repo ]] && repo="-" || true
+          printf '%s\t%s\t%s\t%s\n' \
+            "$id" "$mark" "$repo" "${br:--}"
+        done \
+      | sort -t$'\t' -k3,3 -k4,4 \
+      | column -t -s$'\t'
+  )
+  [[ -z $rows ]] && { warn "no PR review spaces open"; return 0; }
+
+  # grep exits 1 when the current space is not in this list (always true for
+  # the reviews picker unless you are already in a review). With pipefail that
+  # fails the assignment, and set -e would abort before the fallback below.
+  idx=$(printf '%s\n' "$rows" | grep -n "^${cur}[[:space:]]" | head -1 | cut -d: -f1) || idx=""
+  [[ -z $idx ]] && idx=1 || true
+
+  export HW_FZF_HOME=$idx
+  pick=$(printf '%s\n' "$rows" \
+    | _fzf --prompt='review > ' --with-nth=2.. --bind "load:pos($idx)" \
+           --header='PR reviews') || return 0
+
+  ws=$(awk '{print $1}' <<<"$pick")
+  [[ -z $ws ]] && return 0
+  focus_target "$ws"
+}
+
+# A popup picker over live agents, across every space. Rows carry the space
+# label and branch so two agents in the same repo stay distinguishable.
+cmd_agents() {
+  need fzf
+  local pick target spaces
+  hw_debug_env agents
+  spaces=$(herdr workspace list 2>/dev/null | jq -c '[.result.workspaces[]?
+             | {id: .workspace_id, label: (.label // .workspace_id),
+                branch: (.tokens.branch // "")}]') || spaces='[]'
+
+  local rows idx
+  rows=$(
+    herdr agent list 2>/dev/null \
+      | jq -r --argjson sp "$spaces" --arg cur "$(here_workspace)" '
+          # Glyphs match the set herdr uses in its sidebar:
+          # working, blocked, done, idle, unknown.
+          # U+25D0 is missing from common terminal fonts and falls back to
+          # another face, so a filled circle stands in for "working".
+          def icon:
+            if   . == "working" then "\u25cf"
+            elif . == "blocked" then "\u00d7"
+            elif . == "done"    then "\u2713"
+            elif . == "idle"    then "\u25cb"
+            else "\u00b7" end;
+          # Finished first -- those are the ones waiting on you -- then blocked,
+          # then still running, then idle.
+          def rank:
+            if   . == "done"    then 0
+            elif . == "blocked" then 1
+            elif . == "working" then 2
+            elif . == "idle"    then 3
+            else 4 end;
+          [ .result.agents[]? ]
+          | sort_by([((.agent_status // "") | rank),
+                     (if .workspace_id == $cur then 0 else 1 end),
+                     (.workspace_id // ""), (.pane_id // "")])
+          | .[]
+          | . as $a
+          | ($sp[] | select(.id == $a.workspace_id)) // {label: $a.workspace_id, branch: ""}
+          | . as $w
+          | [ $a.pane_id,
+              (if $a.focused then "*"
+               else (($a.agent_status // "") | icon) end),
+              $w.label,
+              (if $w.branch == "" then "-" else $w.branch end),
+              ($a.name // $a.agent // "?"),
+              (($a.terminal_title_stripped // "") | .[0:48])
+            ] | @tsv' \
+      | column -t -s$'\t'
+  )
+  [[ -z $rows ]] && { warn "no agents running"; return 0; }
+
+  # Start the cursor on the focused agent.
+  idx=$(printf '%s\n' "$rows" | grep -n '^[^ ]*  *\*' | head -1 | cut -d: -f1)
+  [[ -z $idx ]] && idx=1
+
+  pick=$(printf '%s\n' "$rows" \
+    | _fzf --prompt='agent > ' --with-nth=2.. \
+           --header='this space first   * focused   ○ idle  ◐ working  ● needs attention  ✓ done') \
+    || return 0
+
+  target=$(awk '{print $1}' <<<"$pick")
+  [[ -z $target ]] && return 0
+  # pane ids are "<workspace>:<pane>", so the space comes for free.
+  focus_target "${target%%:*}" "$target"
+}
+
+# Scan every project for inconsistent state. `hw doctor --fix` repairs it.
+cmd_doctor() {
+  local fix=0 issues=0 proj main path st ws
+  [[ ${1:-} == --fix ]] && fix=1
+
+  for d in "$HW_ROOT"/*/; do
+    proj=$(basename "$d")
+    [[ $proj == .hw-trash ]] && continue
+    main=$(repo_main "$proj" 2>/dev/null || true)
+    if [[ -z $main ]]; then
+      [[ -n $(ls -A "$d" 2>/dev/null) ]] \
+        && { printf '  %-22s no canonical checkout\n' "$proj"; issues=$((issues+1)); }
+      continue
+    fi
+
+    # Worktree directories that git no longer knows about, and vice versa.
+    for path in "$d"*/; do
+      path=${path%/}
+      [[ $path == "$main" ]] && continue
+      st=$(worktree_state "$main" "$path")
+      case "$st" in
+        ready) ;;
+        orphan)
+          printf '  %-22s orphan checkout  %s\n' "$proj" "$(basename "$path")"
+          issues=$((issues+1))
+          (( fix )) && quarantine_path "$path" >/dev/null 2>&1
+          ;;
+        foreign)
+          printf '  %-22s not a checkout   %s\n' "$proj" "$(basename "$path")"
+          issues=$((issues+1))
+          ;;
+      esac
+    done
+
+    # Registrations pointing at directories that are gone.
+    while IFS= read -r path; do
+      [[ -z $path || -d $path ]] && continue
+      printf '  %-22s stale registration  %s\n' "$proj" "$(basename "$path")"
+      issues=$((issues+1))
+      (( fix )) && git -C "$main" worktree prune 2>/dev/null
+    done < <(git -C "$main" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10)}')
+
+    # Branches with no upstream: these silently break gh and the review panel.
+    while IFS= read -r path; do
+      [[ -z $path || ! -d $path ]] && continue
+      local br
+      br=$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null) || continue
+      [[ $br == HEAD ]] && continue
+      git -C "$path" rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1 && continue
+      if git -C "$path" show-ref --verify --quiet "refs/remotes/origin/$br"; then
+        printf '  %-22s no upstream      %s\n' "$proj" "$br"
+        issues=$((issues+1))
+        (( fix )) && git -C "$path" branch --set-upstream-to "origin/$br" >/dev/null 2>&1
+      fi
+    done < <(git -C "$main" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10)}')
+  done
+
+  # Workspaces whose checkout no longer exists.
+  while IFS=$'\t' read -r ws path; do
+    [[ -z $path || $path == null || -d $path ]] && continue
+    printf '  %-22s workspace %s points at a missing checkout\n' "-" "$ws"
+    issues=$((issues+1))
+    (( fix )) && herdr workspace close "$ws" >/dev/null 2>&1
+  done < <(herdr workspace list 2>/dev/null \
+           | jq -r '.result.workspaces[]? | select(.worktree != null)
+                    | "\(.workspace_id)\t\(.worktree.checkout_path)"')
+
+  if (( issues == 0 )); then
+    info "no problems found"
+  elif (( fix )); then
+    info "$issues issue(s) addressed; anything removed is under $HW_ROOT/.hw-trash"
+  else
+    info "$issues issue(s) found — run 'hw doctor --fix' to repair"
+  fi
+}
+
+# Poll CI/PR state for every open worktree workspace into the sidebar.
+cmd_watch() {
+  need gh
+  info "watching every ${HW_WATCH_INTERVAL}s (ctrl-c to stop)"
+  while :; do
+    refresh_pr_cache
+    sync_space_markers "$(herdr workspace list 2>/dev/null)"
+    while IFS=$'\t' read -r ws path; do
+      [[ -z $path || $path == null || ! -d $path ]] && continue
+      report_session_tokens "$ws" "$path"
+      local num state ci
+      # Run gh from inside the checkout so it infers repo and branch itself.
+      num=$(cd "$path" && gh pr view --json number --jq '.number' 2>/dev/null) || num=""
+
+      if [[ -n $num && $num != null ]]; then
+        state=$(cd "$path" && gh pr checks 2>/dev/null | awk -F'\t' '{print $2}' | sort -u | tr '\n' ' ') || state=""
+        case "$state" in
+          *fail*)    ci="✗" ;;
+          *pending*) ci="●" ;;
+          *pass*)    ci="✓" ;;
+          *)         ci="·" ;;
+        esac
+        herdr workspace report-metadata "$ws" --source hw \
+          --token pr="#$num" --token ci="$ci" --ttl-ms $((HW_WATCH_INTERVAL * 3000)) >/dev/null 2>&1 || true
+      else
+        herdr workspace report-metadata "$ws" --source hw \
+          --clear-token pr --clear-token ci >/dev/null 2>&1 || true
+      fi
+    done < <(hw_sessions)
+    sleep "$HW_WATCH_INTERVAL"
+  done
+}
+
+# herdr's sidebar groups worktree spaces under their repo and leaves everything
+# else loose wherever it was opened. Push the loose ones to the end so they read
+# as one block instead of splitting the repo groups apart. Ordering is the only
+# lever: herdr has no user-defined groups, so they get adjacency, not a header.
+#
+# `workspace.move_block` is socket-only -- the CLI exposes no reorder command --
+# and with no anchor it moves the block to the end.
+group_loose_spaces() {
+  local ws_json=${1:?} ids n tail_ids sock=${HERDR_SOCKET_PATH:-$HOME/.config/herdr/herdr.sock}
+  [[ -S $sock ]] || return 0
+  ids=$(jq -c '[.result.workspaces[]?
+                | select((.worktree.repo_name // "") == "")
+                | .workspace_id]' <<<"$ws_json" 2>/dev/null) || return 0
+  [[ -z $ids || $ids == "[]" ]] && return 0
+  # Already the contiguous tail? Then skip the write, so a picker running this
+  # on every open stays silent and cheap.
+  n=$(jq 'length' <<<"$ids" 2>/dev/null) || return 0
+  tail_ids=$(jq -c --argjson n "$n" \
+               '[.result.workspaces[]?.workspace_id] | .[-$n:]' <<<"$ws_json" 2>/dev/null) || return 0
+  [[ $tail_ids == "$ids" ]] && return 0
+  printf '{"id":"hw","method":"workspace.move_block","params":{"workspace_ids":%s}}\n' "$ids" \
+    | nc -U "$sock" >/dev/null 2>&1 || true
+}
+
+# herdr keeps workspace metadata in memory only, so a server restart drops every
+# token while the labels survive. Re-assert the markers from the labels.
+cmd_sync() {
+  local ws_json line tmp
+  # A worktree removed outside hw leaves its review entry behind, and a stale
+  # path can never match a space again.
+  #
+  # Written through a temp file rather than captured with $(...): a command
+  # substitution takes its status from the last command inside it, which here
+  # is the `read` that returns 1 at end of input, and errexit then kills the
+  # whole sync before it does anything.
+  if [[ -s $HW_REVIEWS ]]; then
+    tmp=$(mktemp) || tmp=""
+    if [[ -n $tmp ]]; then
+      while IFS= read -r line; do
+        if [[ -n $line && -d $line ]]; then printf '%s\n' "$line" >> "$tmp"; fi
+      done < "$HW_REVIEWS"
+      mv "$tmp" "$HW_REVIEWS"
+    fi
+  fi
+  ws_json=$(herdr workspace list 2>/dev/null)
+  refresh_pr_cache "$ws_json"
+  sync_space_markers "$ws_json"
+  group_loose_spaces "$ws_json"
+  info "sidebar markers re-asserted"
+}
+
+# One entry point for every way of starting work. Bound to a single herdr key.
+# Project first, then what to do in it — the same order as picking a folder in
+# a GUI. Sub-commands take the resolved source so nothing asks twice.
+cmd_spawn() {
+  need fzf
+  local proj src pick action
+  proj=$(pick_repo) || return 0
+  [[ -z $proj ]] && return 0
+
+  if [[ $proj == "+add" ]]; then
+    proj=$(add_folder_interactive) || return 0
+    [[ -z $proj ]] && return 0
+  fi
+
+  src=$(ensure_repo "$proj") || return 0
+  [[ -z $src ]] && die "could not resolve a git source for '$proj'"
+
+  pick=$(printf '%s\n' \
+    "branch   branch or PR     check out existing work" \
+    "review   review a PR      worktree + Claude running the pr-review skill" \
+    "prompt   new prompt       describe it, Claude picks up from there" \
+    "linear   Linear ticket    pick one of your assigned issues" \
+    "open     default branch   just open the repo" \
+    | _fzf --prompt="$proj > " --header="what in $proj?") || return 0
+  action=$(awk '{print $1}' <<<"$pick")
+
+  case "$action" in
+    branch) cmd_branch "$src" ;;
+    review) cmd_review "$src" ;;
+    prompt) cmd_new_in "$src" ;;
+    linear) cmd_linear "$src" ;;
+    open)   cmd_open_default "$src" ;;
+  esac
+}
+
+# Spawn a worktree for an open PR and hand it to Claude for review.
+cmd_review() {
+  need fzf; need gh
+  local src=${1:?} proj pick branch num prompt
+
+  if [[ $src == "$HW_ROOT"/* ]]; then proj=$(project_of "$src")
+  else proj=$(registry_name_for_src "$src"); [[ -n $proj ]] || proj=$(basename "$src"); fi
+
+  if git -C "$src" remote get-url origin >/dev/null 2>&1; then
+    info "fetching refs"
+    git -C "$src" fetch --prune --quiet origin 2>/dev/null || true
+  fi
+
+  # Branch name only, same as the branch picker; the PR number rides along in
+  # a trailing field that fzf still matches on but which stays readable.
+  pick=$(gh pr list --repo "$HW_ORG/$proj" --limit 100 \
+           --json number,headRefName,title \
+           --jq '.[] | "\(.headRefName)\t#\(.number)  \(.title)"' 2>/dev/null \
+         | column -t -s$'\t' \
+         | _fzf --prompt="review $proj > " --header='pick a PR to review') || return 0
+  [[ -z $pick ]] && return 0
+
+  branch=$(awk '{print $1}' <<<"$pick")
+  num=$(grep -oE '#[0-9]+' <<<"$pick" | head -1 | tr -d '#')
+  [[ -z $branch || -z $num ]] && die "could not parse the selected PR"
+
+  prompt="Use the pr-review skill to review PR #${num} (branch ${branch}) in ${HW_ORG}/${proj}.
+
+The branch is checked out in this worktree. Read the diff against its base, follow the skill's method, and report in the terminal. Only flag things that would actually break the app — no nits, no style, no padding. If nothing serious is wrong, say so."
+
+  local ws path
+  ws=$(create_worktree "$src" "$branch" "" "" "$prompt")
+  [[ -z $ws ]] && return 0
+
+  # Record the worktree, then let the usual sync put the marker in the sidebar.
+  path=$(herdr workspace list 2>/dev/null \
+         | jq -r --arg w "$ws" '.result.workspaces[]?
+                                | select(.workspace_id == $w)
+                                | .worktree.checkout_path // empty')
+  [[ -n $path ]] && review_mark "$path" || warn "could not record $ws as a review"
+  sync_space_markers "$(herdr workspace list 2>/dev/null)"
+}
+
+# Open a project's default branch without inventing a new one.
+cmd_open_default() {
+  local src=${1:?} proj def
+  proj=$(project_of "$src")
+  [[ $src == "$HW_ROOT"/* ]] || proj=$(registry_name_for_src "$src" || basename "$src")
+  def=$(git -C "$src" symbolic-ref --quiet --short HEAD 2>/dev/null) \
+    || def=$(git -C "$src" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||') \
+    || def=main
+  create_worktree "$src" "$def" "" "" "" >/dev/null
+}
+
+# Prompt-seeded worktree in an already-chosen project.
+cmd_new_in() {
+  local src=${1:?} prompt branch
+  read -r -p "what are you working on? " prompt
+  [[ -z $prompt ]] && return 0
+  branch="${HW_BRANCH_PREFIX}$(branch_name_for "$prompt")"
+  create_worktree "$src" "$branch" \
+    "$(git -C "$src" symbolic-ref --quiet --short HEAD 2>/dev/null || echo HEAD)" \
+    "" "$prompt" >/dev/null
+}
+
+cmd_menu() { cmd_spawn; }
+
+usage() { sed -n '2,30p' "$0" | grep '^#' | sed 's/^# \{0,1\}//'; }
+
+main() {
+  local sub=${1:-menu}; shift || true
+  case "$sub" in
+    spawn|menu)    cmd_spawn ;;
+    proj|p)        cmd_proj ;;
+    new|n)         cmd_new "$@" ;;
+    branch|b)      cmd_branch ;;
+    linear|l)      cmd_linear ;;
+    linear-auth)   cmd_linear_auth ;;
+    ci)            cmd_ci ;;
+    pr)            cmd_pr ;;
+    rm)            cmd_rm ;;
+    add|a)         cmd_add "$@" ;;
+    projects|ls)   cmd_projects ;;
+    spaces|s)      cmd_spaces ;;
+    agents|ag)     cmd_agents ;;
+    reviews|rv)    cmd_reviews ;;
+    close|x)       cmd_close "$@" ;;
+    doctor)        cmd_doctor "$@" ;;
+    sync)          cmd_sync ;;
+    __teardown)    job_teardown "$@" ;;
+    __setup)       job_setup "$@" ;;
+    watch)         cmd_watch ;;
+    -h|--help|help) usage ;;
+    *)             die "unknown command: $sub (try: hw help)" ;;
+  esac
+}
+
+# HW_LIB=1 sources the functions without dispatching (used by tests).
+[[ ${HW_LIB:-} == 1 ]] && return 0
+
+# Popups close the moment the command exits; hold the last screen for reading.
+if [[ ${HW_NO_PAUSE:-} != 1 && -t 1 ]]; then
+  trap 'st=$?; (( st != 0 )) && pause; exit $st' EXIT
+fi
+
+main "$@"
