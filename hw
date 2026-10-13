@@ -70,6 +70,9 @@ HW_BRANCH_TTL="${HW_BRANCH_TTL:-5}"
 # Where detached jobs write. They have no terminal to report to, so this is the
 # only record of a setup hook or a removal that went wrong.
 HW_JOBLOG="${HW_JOBLOG:-$HW_CACHE/jobs.log}"
+# The space a detached job belongs to. Global because the EXIT trap that clears
+# its status row runs after the job function's locals have gone.
+HW_JOB_WS=""
 
 mkdir -p "$HW_CACHE"
 
@@ -655,10 +658,11 @@ remove_checkout() {
 # this work, which is the reason the work moved out here.
 job_teardown() {
   local path=${1:?} ws=${2:-}
+  HW_JOB_WS=$ws
   printf '%s teardown %s (%s)\n' "$(date +%FT%T)" "$path" "${ws:--}" >&2
   # However this ends, the space must not be left reporting work nobody is
   # doing: the row would spin forever with no job behind it.
-  trap 'job_status "$ws" ""' EXIT
+  trap 'job_status "$HW_JOB_WS" ""' EXIT
   remove_checkout "$path"
   if [[ -n $ws && $ws != "-" ]]; then
     job_status "$ws" ""
@@ -672,10 +676,11 @@ job_teardown() {
 # can run for minutes.
 job_setup() {
   local src=${1:?} path=${2:?} ws=${3:?} pane=${4:-} name=${5:-} prompt=${6:-}
+  HW_JOB_WS=$ws
   printf '%s setup %s (%s)\n' "$(date +%FT%T)" "$path" "$ws" >&2
   # However this ends, the space must not be left reporting work nobody is
   # doing: the row would spin forever with no job behind it.
-  trap 'job_status "$ws" ""' EXIT
+  trap 'job_status "$HW_JOB_WS" ""' EXIT
   run_setup "$src" "$path" "$ws" || warn "setup failed for $path"
   if [[ -n $prompt && -n $pane ]] && ! workspace_has_agent "$ws"; then
     start_agent "$ws" "$pane" "$name" "$prompt"
