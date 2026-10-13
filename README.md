@@ -144,6 +144,25 @@ Spawning is deliberately **not** cwd-aware — `hw spawn` always asks which
 project first, so any branch of any repo can be started from anywhere.
 Tune discovery with `HW_SCAN_DIRS` / `HW_SCAN_DEPTH` in `config.sh`.
 
+## Writing the prompt
+
+`prompt` opens a blank buffer in your editor rather than asking for one line at
+a shell prompt. Write as much as you like, save, and the worktree is named from
+it and the agent seeded with it.
+
+```sh
+HW_EDITOR=nvim   # falls back to $VISUAL, then $EDITOR, then nvim
+```
+
+The buffer is a `.md` file so nvim treats it as prose. Lines starting with `#`
+are stripped, so the two-line hint at the bottom cannot reach the agent, and
+saving nothing cancels. Line breaks are kept: herdr wraps an agent prompt in a
+bracketed paste, where a newline is a newline rather than a submit.
+
+`read -p` was wrong here twice over — a popup's stdin is not reliably a
+terminal, which is what used to hang `hw close`, and one unscrollable line is a
+poor place to write a paragraph.
+
 ## Branch naming
 
 A prompted worktree gets a short name, not a slug of the whole sentence:
