@@ -45,7 +45,10 @@ HW_WATCH_INTERVAL="${HW_WATCH_INTERVAL:-90}"
 # matched against, alongside each repo's recent branch names.
 HW_SPAWN_REPOS="${HW_SPAWN_REPOS:-\
 junior: the Junior product and the default: web app, API, projects, tracker and insights grid, sessions and calls, uploads and transcription, access groups and tags, inngest pipelines
-cs-ops: internal customer-success and on-call tooling: the on-call command center and its views (stranded and stuck calls, globe, network grid, telemetry), support workflows, Retool replacements}"
+cs-ops: internal customer-success and on-call tooling: the on-call command center and its views (stranded and stuck calls, globe, network grid, telemetry), support workflows, Retool replacements
+sandbox: not a repo -- the home directory, for one-off work outside any codebase: calling the sandbox environment, scripts, investigations, machine and tool setup}"
+# Where a sandbox session opens. Not a repo, so it gets no worktree or branch.
+HW_SANDBOX_DIR="${HW_SANDBOX_DIR:-$HOME}"
 # Marks a PR-review space, in its label and in every picker. U+F407 is the
 # Nerd Font pull-request glyph: it exists in the terminal font in BOTH regular
 # and bold, which a plain-Unicode arrow like U+21C4 does not. fzf bolds the
@@ -421,10 +424,15 @@ spawn_repo_names() {
 }
 
 # Ask which repo, when the request did not say: the spawn repos first, then
-# everything else.
+# everything else. --repos-only leaves out the sandbox, for actions that need
+# a real repository.
 choose_repo() {
-  local header=${1:-which repo?} pick
-  pick=$({ spawn_repo_names; printf '%s\n' "other…"; } \
+  local header=${1:-which repo?} pick names
+  names=$(spawn_repo_names)
+  if [[ ${2:-} == --repos-only ]]; then
+    names=$(grep -vx sandbox <<<"$names")
+  fi
+  pick=$({ printf '%s\n' "$names"; printf '%s\n' "other…"; } \
          | _fzf --prompt='repo > ' --header="$header") || return 1
   [[ $pick == "other…" ]] || { printf '%s' "$pick"; return 0; }
   pick=$(pick_repo) || return 1
@@ -435,7 +443,7 @@ choose_repo() {
 # A project's checkout to work from, asking for the project when there is none.
 spawn_src() {
   local proj=${1:-} header=${2:-which repo?} src
-  [[ -n $proj ]] || proj=$(choose_repo "$header") || return 1
+  [[ -n $proj ]] || proj=$(choose_repo "$header" --repos-only) || return 1
   [[ -n $proj ]] || return 1
   src=$(ensure_repo "$proj") || return 1
   [[ -n $src ]] || die "could not resolve a git source for '$proj'"
@@ -2138,12 +2146,38 @@ spawn_request() {
   rest=${routed#*$'\t'}
   repo=${rest%%$'\t'*}
   detail=${rest#*$'\t'}
-  src=$(spawn_src "$repo" "which repo for: ${request:0:70}") || return 0
+  # The sandbox is not a repo: whatever was asked, it is a session there.
+  [[ -z $repo ]] && repo=$(choose_repo "which repo for: ${request:0:70}") || true
+  [[ -n $repo ]] || return 0
+  if [[ $repo == sandbox ]]; then
+    [[ $kind == create ]] || detail=""
+    cmd_sandbox "$request" "$detail"
+    return 0
+  fi
+  src=$(spawn_src "$repo") || return 0
   case "$kind" in
     review) cmd_review "$src" "$detail" ;;
     branch) cmd_branch "$src" "$detail" ;;
     *)      cmd_new_in "$src" "$request" "$detail" ;;
   esac
+}
+
+# A session in the sandbox: a plain workspace in HW_SANDBOX_DIR -- not a repo,
+# so no worktree and no branch -- with the agent seeded with the request.
+cmd_sandbox() {
+  local prompt=${1:?} name=${2:-} out ws pane
+  [[ -n $name ]] || name=$(slug_concise "$prompt")
+  [[ -n $name ]] || name=sandbox
+  job_log "sandbox $name"
+  out=$(herdr workspace create --cwd "$HW_SANDBOX_DIR" --label "sandbox  $name" --focus) \
+    || die "could not open a sandbox session"
+  ws=$(jq -r '.result.workspace.workspace_id // empty' <<<"$out")
+  [[ -n $ws ]] || die "could not read the sandbox workspace id"
+  pane=$(herdr pane list 2>/dev/null \
+    | jq -r --arg w "$ws" '[.result.panes[]? | select(.workspace_id == $w)][0].pane_id // empty')
+  [[ -n $pane ]] || die "could not find the sandbox session's pane"
+  start_agent "$ws" "$pane" "$name" "$prompt"
+  printf '%s\n' "$ws"
 }
 
 # What ask_request prints when the action list was asked for instead.

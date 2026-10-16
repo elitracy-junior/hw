@@ -62,6 +62,22 @@ wait_until '[[ -z $(token '"$ws3"' hw_status) ]]' 60 \
   && ok "the status clears when the job ends" \
   || bad "the status clears when the job ends"
 
+group "a sandbox session opens a plain workspace in the sandbox directory"
+sandbox_dir="$HWT_DIR/sandbox"; mkdir -p "$sandbox_dir"
+seeded="$HWT_DIR/sandbox-seeded"
+sb_ws=$(
+  HW_SANDBOX_DIR=$sandbox_dir
+  start_agent() { printf '%s\n%s\n' "$2" "$4" > "$seeded"; }
+  cmd_sandbox "call the sandbox api and report back" "sandbox-api" 2>/dev/null | tail -1
+)
+assert_contains "$sb_ws" "w" "a workspace is opened"
+sb_cwd=$(herdr pane list 2>/dev/null \
+  | jq -r --arg w "$sb_ws" '[.result.panes[]? | select(.workspace_id == $w)][0].cwd // empty')
+assert_eq "$(cd "$sandbox_dir" && pwd -P)" "$(cd "$sb_cwd" 2>/dev/null && pwd -P)" \
+  "it opens in the sandbox directory"
+assert_contains "$(cat "$seeded" 2>/dev/null)" "call the sandbox api" "the agent is seeded with the request"
+assert_no_dir "$sandbox_dir/.git" "no worktree or repo is made there"
+
 group "a detached job survives its caller being killed off"
 # herdr signals every process in a closing pane's session. This sweeps the
 # caller's session the same way, which is as close as a test gets -- it does not

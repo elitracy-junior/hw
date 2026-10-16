@@ -168,7 +168,14 @@ One quick model call reads the text:
 It also picks the repo from `HW_SPAWN_REPOS` (one `name: what it is` per
 line, the default first — junior, then cs-ops), matching the request against
 each repo's description and recent branch names. "The repo" means the first.
-When the request does not settle it, it asks: junior, cs-ops, or other….
+When the request does not settle it, it asks: junior, cs-ops, sandbox, or
+other….
+
+**sandbox** is not a repo: it opens a plain session in `HW_SANDBOX_DIR` (your
+home directory by default) with Claude seeded with the request, for one-off
+work outside any codebase, like calling the sandbox environment. No worktree,
+no branch. Say "in the sandbox…" or describe something that only makes sense
+there.
 
 An action picked with `ctrl-o` then asks which repo.
 
