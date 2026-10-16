@@ -77,6 +77,12 @@ assert_eq "$(cd "$sandbox_dir" && pwd -P)" "$(cd "$sb_cwd" 2>/dev/null && pwd -P
   "it opens in the sandbox directory"
 assert_contains "$(cat "$seeded" 2>/dev/null)" "call the sandbox api" "the agent is seeded with the request"
 assert_no_dir "$sandbox_dir/.git" "no worktree or repo is made there"
+assert_eq "sandbox" "$(token "$sb_ws" group)" "it joins the sandbox group in the sidebar"
+# A sandbox session opened some other way joins the group on the next sync.
+other_ws=$(herdr workspace create --cwd "$sandbox_dir" --label "sandbox by hand" --no-focus \
+             | jq -r '.result.workspace.workspace_id')
+( HW_SANDBOX_DIR=$sandbox_dir; sync_space_markers "$(herdr workspace list)" )
+assert_eq "sandbox" "$(token "$other_ws" group)" "a sync groups sandbox sessions opened by hand"
 
 group "a detached job survives its caller being killed off"
 # herdr signals every process in a closing pane's session. This sweeps the

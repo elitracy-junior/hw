@@ -796,6 +796,29 @@ sync_space_markers() {
                (if (.tokens.pr_state // "") == "" then "~" else .tokens.pr_state end) ]
            | @tsv' <<<"$ws_json" 2>/dev/null
   )
+  sync_sandbox_group "$ws_json"
+}
+
+# Sessions opened in the sandbox directory report group=sandbox, which herdr's
+# sidebar nests under one heading. The sandbox is not a repo, so herdr has no
+# worktree to group them by. Re-asserted on every sync: metadata does not
+# outlive the herdr server.
+sync_sandbox_group() {
+  local ws_json=${1:?} sandbox loose panes ws cwd
+  loose=$(jq -r '.result.workspaces[]?
+                 | select(.worktree == null and (.tokens.group // "") != "sandbox")
+                 | .workspace_id' <<<"$ws_json" 2>/dev/null) || return 0
+  [[ -z $loose ]] && return 0
+  sandbox=$(real_path "$HW_SANDBOX_DIR")
+  panes=$(herdr pane list 2>/dev/null) || return 0
+  while read -r ws; do
+    [[ -z $ws ]] && continue
+    cwd=$(jq -r --arg w "$ws" '[.result.panes[]? | select(.workspace_id == $w)][0].cwd // empty' \
+            <<<"$panes" 2>/dev/null) || cwd=""
+    [[ -n $cwd && $(real_path "$cwd") == "$sandbox" ]] || continue
+    herdr workspace report-metadata "$ws" --source hw --token group=sandbox >/dev/null 2>&1 || true
+  done <<<"$loose"
+  return 0
 }
 
 report_session_tokens() {
@@ -2176,6 +2199,7 @@ cmd_sandbox() {
   pane=$(herdr pane list 2>/dev/null \
     | jq -r --arg w "$ws" '[.result.panes[]? | select(.workspace_id == $w)][0].pane_id // empty')
   [[ -n $pane ]] || die "could not find the sandbox session's pane"
+  herdr workspace report-metadata "$ws" --source hw --token group=sandbox >/dev/null 2>&1 || true
   start_agent "$ws" "$pane" "$name" "$prompt"
   printf '%s\n' "$ws"
 }

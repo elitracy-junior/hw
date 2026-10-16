@@ -177,6 +177,11 @@ work outside any codebase, like calling the sandbox environment. No worktree,
 no branch. Say "in the sandbox…" or describe something that only makes sense
 there.
 
+Sandbox sessions nest under one **sandbox** heading in the sidebar: hw reports
+`group=sandbox` on every workspace opened in `HW_SANDBOX_DIR` (on creation, and
+again on each `hw sync` / `hw watch`, since metadata does not outlive the herdr
+server). Needs the patched herdr, which groups spaces by that token.
+
 An action picked with `ctrl-o` then asks which repo.
 
 Tune discovery with `HW_SCAN_DIRS` / `HW_SCAN_DEPTH` in `config.sh`.
