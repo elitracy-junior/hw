@@ -379,7 +379,7 @@ route_request() {
       --sort=-committerdate --count=15 --format='%(refname:lstrip=2)' refs/heads 2>/dev/null \
       | paste -sd, -)"$'\n'
   done <<<"$repos"
-  info "reading the request…"
+  info "auto: working out the repo and what to do…"
   reply=$(ask_model routing "You route a developer's typed or dictated request to start work. Reply with exactly one line and nothing else, in one of these forms:
 create <repo> <branch-name>
 review <repo> <search terms>
@@ -2104,18 +2104,23 @@ cmd_sync() {
 # a GUI. Sub-commands take the resolved source so nothing asks twice.
 cmd_spawn() {
   need fzf
-  local pick action src
-  pick=$(pick_spawn) || return 0
-  action=${pick%%$'\t'*}
-  if [[ $action == prompt ]]; then
-    spawn_request "${pick#*$'\t'}"
+  local request action src
+  request=$(ask_request) || return 0
+  if [[ $request != "$HW_PICK_ACTION" ]]; then
+    spawn_request "$request"
     return 0
   fi
+  action=$(printf '%s\n' \
+    "branch   pull a branch or PR" \
+    "review   review a PR" \
+    "linear   start from a Linear ticket" \
+    "open     open the repo on its default branch" \
+    | _fzf --prompt='action > ' | awk '{print $1}') || return 0
+  [[ -n $action ]] || return 0
   src=$(spawn_src "" "$action in which repo?") || return 0
   case "$action" in
     branch) cmd_branch "$src" ;;
     review) cmd_review "$src" ;;
-    editor) cmd_new_in "$src" ;;
     linear) cmd_linear "$src" ;;
     open)   cmd_open_default "$src" ;;
   esac
@@ -2141,33 +2146,54 @@ spawn_request() {
   esac
 }
 
-# What to spawn: "<action>" or "prompt<TAB><text>".
+# What ask_request prints when the action list was asked for instead.
+HW_PICK_ACTION=$'\x01action'
+
+# What to spawn, typed or dictated into one block of text: the request, or
+# HW_PICK_ACTION to pick an action instead. Fails when cancelled.
 #
-# Nearly every spawn is a prompt, so typing on this page writes one. The list
-# does not filter (--disabled), so the arrows still pick an action when nothing
-# is typed, and the preview shows the prompt wrapped as a block -- fzf's own
-# query line scrolls sideways, off the edge of the page.
-pick_spawn() {
-  local out query pick
-  out=$(printf '%s\n' \
-    "branch   branch or PR     check out existing work" \
-    "review   review a PR      worktree + Claude running the pr-review skill" \
-    "linear   Linear ticket    pick one of your assigned issues" \
-    "open     default branch   just open the repo" \
-    "editor   new prompt       write the prompt in \$EDITOR" \
-    | _fzf --disabled --print-query --prompt="spawn > " \
-        --header="type or dictate it: new work, a PR to review, a branch to pull; or pick one:" \
-        --preview='[ -n {q} ] && printf "%s\n" {q} || printf "\033[2m%s\033[0m\n" "start typing: it becomes the prompt for a new worktree"' \
-        --preview-window='down,70%,wrap-word,border-top' \
-        --bind 'change:refresh-preview') || return 1
-  query=$(head -n 1 <<<"$out")
-  pick=$(sed -n 2p <<<"$out")
-  if [[ -n ${query//[[:space:]]/} ]]; then
-    printf 'prompt\t%s' "$query"
+# A bare nvim rather than an fzf prompt: fzf's query is one line that scrolls
+# off the page, where this wraps the text as it arrives -- dictation included --
+# and keeps pasted line breaks. --clean keeps the user's config out of it, so it
+# opens at once and every key does what the footer says.
+ask_request() {
+  local dir file init pick status=0 body
+  dir=$(mktemp -d "${TMPDIR:-/tmp}/hw-request-XXXXXX") || return 1
+  file="$dir/request.txt" init="$dir/init.lua" pick="$dir/pick"
+  : >"$file"
+  cat >"$init" <<'LUA'
+local o = vim.o
+o.wrap, o.linebreak = true, true
+o.number, o.relativenumber, o.signcolumn = false, false, "no"
+o.swapfile, o.undofile, o.showmode, o.ruler = false, false, false, false
+o.shortmess = o.shortmess .. "I"
+o.fillchars = "eob: "
+o.laststatus, o.cmdheight = 2, 0
+o.winbar = "%#Title#  auto%* %#Comment#describe the work: the repo, and whether it is new work, a review or a branch, are picked up from what you say%*"
+o.statusline = "%#Comment#  enter start   ctrl-j new line   ctrl-o pick an action instead   esc esc cancel%*"
+local function done(code) vim.cmd("silent! write"); vim.cmd("cquit " .. code) end
+vim.keymap.set({ "i", "n" }, "<CR>", function() done(0) end)
+vim.keymap.set({ "i", "n" }, "<C-o>", function()
+  vim.fn.writefile({}, vim.env.HW_REQUEST_PICK); done(0)
+end)
+vim.keymap.set("n", "<Esc>", function() vim.cmd("cquit 1") end)
+vim.cmd.startinsert()
+LUA
+  # Take /dev/tty when it opens, the way fzf does; a popup's stdio may not be one.
+  if { : </dev/tty; } 2>/dev/null; then
+    HW_REQUEST_PICK=$pick nvim --clean -n -i NONE -u "$init" "$file" </dev/tty >/dev/tty 2>&1 || status=$?
+  else
+    HW_REQUEST_PICK=$pick nvim --clean -n -i NONE -u "$init" "$file" || status=$?
+  fi
+  if (( status == 0 )) && [[ -e $pick ]]; then
+    rm -rf "$dir"
+    printf '%s' "$HW_PICK_ACTION"
     return 0
   fi
-  [[ -n $pick ]] || return 1
-  awk '{print $1}' <<<"$pick"
+  body=$(cat "$file" 2>/dev/null)
+  rm -rf "$dir"
+  (( status == 0 )) && [[ -n ${body//[[:space:]]/} ]] || return 1
+  printf '%s' "$body"
 }
 
 # Spawn a worktree for an open PR and hand it to Claude for review.

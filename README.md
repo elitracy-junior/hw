@@ -145,9 +145,19 @@ started from anywhere.
 
 ## Spawning from one line
 
-`hw spawn` (`prefix g`) opens straight onto a prompt. Type or dictate what you
-want and press enter; the text wraps in a block below as it grows. One quick
-model call reads it:
+`hw spawn` (`prefix g`) opens straight onto one block of text, headed
+**auto**. Type or dictate what you want and press enter; the text wraps as it
+arrives and keeps pasted line breaks. It is a bare `nvim --clean`, so it opens
+at once and your config cannot change its keys:
+
+| Key | Does |
+|---|---|
+| `enter` | start |
+| `ctrl-j` | new line |
+| `ctrl-o` | pick an action instead: pull a branch, review a PR, a Linear ticket, open the repo |
+| `esc` `esc` | cancel (one `esc` is normal mode, for editing) |
+
+One quick model call reads the text:
 
 - **new work** (the default) — names the branch and spawns the worktree with
   Claude seeded with the request.
@@ -160,15 +170,14 @@ line, the default first — junior, then cs-ops), matching the request against
 each repo's description and recent branch names. "The repo" means the first.
 When the request does not settle it, it asks: junior, cs-ops, or other….
 
-With nothing typed, the arrows pick an action instead (branch, review, linear,
-open, or `editor` to write the prompt in `$EDITOR`), and it then asks which
-repo.
+An action picked with `ctrl-o` then asks which repo.
+
 Tune discovery with `HW_SCAN_DIRS` / `HW_SCAN_DEPTH` in `config.sh`.
 
 ## Writing the prompt
 
-`prompt` opens a blank buffer in your editor rather than asking for one line at
-a shell prompt. Write as much as you like, save, and the worktree is named from
+`hw new` with no prompt opens a blank buffer in your editor rather than asking
+for one line at a shell prompt. Write as much as you like, save, and the worktree is named from
 it and the agent seeded with it.
 
 ```sh
