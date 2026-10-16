@@ -2284,6 +2284,23 @@ LUA
 }
 
 # Spawn a worktree for an open PR and hand it to Claude for review.
+# The branch a review of PR <num> is checked out on: review/pr-<num>, at the
+# PR's head. A review never shares the PR's own branch: git allows a branch in
+# one worktree only, so reusing it would hand the review the space the PR is
+# being written in -- the author's session, the bias a review is meant to
+# avoid. GitHub keeps every PR's head at pull/<n>/head, merged and forked ones
+# included. A review already open keeps its checkout; otherwise the branch is
+# moved to the PR's latest head.
+review_branch() {
+  local src=${1:?} num=${2:?} review
+  review="review/pr-$num"
+  if [[ -z $(worktree_holding_branch "$src" "$review") ]]; then
+    info "fetching PR #$num"
+    git -C "$src" fetch --quiet --force origin "pull/$num/head:$review" || return 1
+  fi
+  printf '%s' "$review"
+}
+
 cmd_review() {
   need fzf; need gh
   local src=${1:?} query=${2:-} proj pick branch num prompt
@@ -2328,21 +2345,15 @@ cmd_review() {
   branch=$(awk '{print $1}' <<<"$pick")
   num=$(grep -oE '#[0-9]+' <<<"$pick" | head -1 | tr -d '#')
   [[ -z $branch || -z $num ]] && die "could not parse the selected PR"
-  # A merged PR's branch is often deleted, and a fork's never was on origin;
-  # GitHub keeps every PR's head at pull/<n>/head.
-  if ! git -C "$src" show-ref --verify --quiet "refs/heads/$branch" \
-     && ! git -C "$src" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
-    info "fetching PR #$num"
-    git -C "$src" fetch --quiet origin "pull/$num/head:$branch" \
-      || die "could not fetch PR #$num"
-  fi
+  local review
+  review=$(review_branch "$src" "$num") || die "could not fetch PR #$num"
 
   prompt="Use the pr-review skill to review PR #${num} (branch ${branch}) in ${HW_ORG}/${proj}.
 
-The branch is checked out in this worktree. Read the diff against its base, follow the skill's method, and report in the terminal. Only flag things that would actually break the app — no nits, no style, no padding. If nothing serious is wrong, say so."
+Its head is checked out in this worktree as ${review}. Read the diff against its base, follow the skill's method, and report in the terminal. Only flag things that would actually break the app — no nits, no style, no padding. If nothing serious is wrong, say so."
 
   local ws path
-  ws=$(create_worktree "$src" "$branch" "" "" "$prompt")
+  ws=$(create_worktree "$src" "$review" "" "" "$prompt")
   [[ -z $ws ]] && return 0
 
   # Record the worktree, then let the usual sync put the marker in the sidebar.

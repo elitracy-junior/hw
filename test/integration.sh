@@ -62,6 +62,28 @@ wait_until '[[ -z $(token '"$ws3"' hw_status) ]]' 60 \
   && ok "the status clears when the job ends" \
   || bad "the status clears when the job ends"
 
+group "a review gets its own checkout even when the PR's branch is open"
+# The PR's branch is feature-one, already checked out above. GitHub keeps the
+# PR's head at refs/pull/<n>/head on origin; a bare clone stands in for it.
+origin="$HWT_DIR/origin.git"
+git clone -q --bare "$src" "$origin"
+git -C "$origin" update-ref refs/pull/7/head "$(git -C "$src" rev-parse feature-one)"
+git -C "$src" remote add origin "$origin" 2>/dev/null || git -C "$src" remote set-url origin "$origin"
+review=$(review_branch "$src" 7 2>/dev/null)
+assert_eq "review/pr-7" "$review" "the review is on a branch of its own"
+assert_eq "$(git -C "$src" rev-parse feature-one)" "$(git -C "$src" rev-parse "$review")" \
+  "at the PR's head"
+rv_ws=$(create_worktree "$src" "$review" "" "" "" 2>/dev/null | tail -1)
+[[ -n $rv_ws && $rv_ws != "$ws" ]] && ok "it opens a space separate from the PR's" \
+                                   || bad "it opens a space separate from the PR's ($rv_ws vs $ws)"
+assert_contains "$(worktree_holding_branch "$src" "$review")" "review-pr-7" "in a checkout of its own"
+# A later commit on the PR: an open review keeps its checkout, so a reviewer
+# mid-way is not moved under; the branch would only move once it is closed.
+git -C "$origin" update-ref refs/pull/7/head "$(git -C "$src" rev-parse HEAD)"
+before=$(git -C "$src" rev-parse "$review")
+review_branch "$src" 7 >/dev/null 2>&1
+assert_eq "$before" "$(git -C "$src" rev-parse "$review")" "an open review is left where it is"
+
 group "a sandbox session opens a plain workspace in the sandbox directory"
 sandbox_dir="$HWT_DIR/sandbox"; mkdir -p "$sandbox_dir"
 seeded="$HWT_DIR/sandbox-seeded"
