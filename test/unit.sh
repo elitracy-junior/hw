@@ -108,6 +108,54 @@ trim_log "$HW_CACHE/no-such-log" && ok "a missing log is harmless" || bad "a mis
 leftover=$(find "$HW_CACHE" -name '*.trim' | wc -l | tr -d ' ')
 assert_eq "0" "$leftover" "trimming leaves no scratch file"
 
+group "reading a model's reply"
+assert_eq "voice-notes-summary" "$(branch_name_from 'feature/voice-notes-summary')" "a branch prefix is dropped"
+assert_eq "oncall-command-center-sensors-readability" \
+  "$(branch_name_from 'oncall-command-center-sensors-readability')" "a long name is kept"
+assert_eq "" "$(branch_name_from 'Sure! Here is a name: fix-it')" "a chatty reply is not a name"
+assert_eq "" "$(branch_name_from '')" "an empty reply is not a name"
+# Offline (HW_SMART_BRANCH=0): no reply, so every request is new work, named
+# offline, in no repo yet -- the spawn then asks which.
+routed=$(route_request 'review dominics corrupted audio PR')
+kind=${routed%%$'\t'*}; rest=${routed#*$'\t'}; repo=${rest%%$'\t'*}; detail=${rest#*$'\t'}
+assert_eq "create" "$kind" "with no model a request is new work"
+assert_eq "" "$repo" "in no repo yet"
+assert_contains "$detail" "corrupted" "and is still named from its words"
+
+group "routing a request"
+assert_eq "junior" "$(spawn_repo_names | head -n 1)" "junior is the default spawn repo"
+assert_contains "$(spawn_repo_names)" "cs-ops" "cs-ops is offered too"
+route_with() { ask_model() { printf '%s' "$REPLY_STUB"; }; REPLY_STUB=$1 route_request "${2:-anything}"; }
+assert_eq $'create\tcs-ops\tstranded-calls-pipeline' "$(route_with 'create cs-ops stranded-calls-pipeline')" \
+  "new work keeps its repo and name"
+assert_eq $'branch\tjunior\tinsights grid drawer' "$(route_with 'branch junior insights grid drawer')" \
+  "a branch request keeps its search terms"
+assert_eq $'create\t\tuploads-retry' "$(route_with 'create ? uploads-retry')" \
+  "an unsure repo is left for the spawn to ask"
+assert_eq $'create\t\tuploads-retry' "$(route_with 'create nowhere uploads-retry')" \
+  "a repo that is not offered is treated as unsure"
+assert_eq $'review\tcs-ops\t631' \
+  "$(route_with 'review cs-ops 631 elis pr about... actually the request names nothing else so use 631')" \
+  "search terms that ran into prose keep just the PR number"
+named=$(route_with 'Sure, here you go' 'add a retry button to uploads')
+assert_eq "create" "${named%%$'\t'*}" "an unreadable reply is new work"
+assert_contains "$named" "retry" "named offline from the request"
+hwt_source_hw
+
+group "picking from dictated search terms"
+_fzf() { printf 'PICKER'; printf ' %s' "$@"; printf '\n'; cat; }
+list=$'eli/insights-grid-drawer\neli/insights-grid-panels\nmain'
+assert_eq "eli/insights-grid-drawer" "$(pick_matching 'insights grid drawer' <<<"$list")" \
+  "one exact match is taken without a picker"
+out=$(pick_matching 'insights grid' <<<"$list")
+assert_contains "$out" "PICKER" "several matches open the picker"
+[[ $out != *main* ]] && ok "narrowed to the matches" || bad "narrowed to the matches"
+out=$(pick_matching 'groups tags api' <<<"$list")
+assert_contains "$out" "nothing matched" "no match says so"
+assert_contains "$out" "main" "and offers everything"
+unset -f _fzf
+hwt_source_hw
+
 group "project naming"
 assert_eq "myproj" "$(project_of "$HW_ROOT/myproj/some-branch")" "project_of reads the project from the path"
 # A checkout registered in place is found by its registered name, not by the

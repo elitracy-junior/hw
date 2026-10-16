@@ -121,10 +121,14 @@ for shape in stale orphan foreign absent; do
   assert_no_dir "$p" "a $shape checkout is left off disk"
 done
 
-group "nothing is ever deleted outright"
+group "a worktree is deleted; a checkout hw cannot vouch for is only moved aside"
 trashed=$(find "$HW_ROOT/.hw-trash" -maxdepth 1 -mindepth 1 2>/dev/null | wc -l | tr -d ' ')
-[[ $trashed -ge 1 ]] && ok "discarded checkouts went to .hw-trash" \
-                     || bad "discarded checkouts went to .hw-trash"
+[[ $trashed -ge 1 ]] && ok "orphan and foreign checkouts went to .hw-trash" \
+                     || bad "orphan and foreign checkouts went to .hw-trash"
+leftover=$(find "$HW_ROOT/.hw-trash" -maxdepth 1 -mindepth 1 -name '*-feature-one' 2>/dev/null | wc -l | tr -d ' ')
+assert_eq "0" "$leftover" "a torn-down worktree leaves no copy in the trash"
+assert_contains "$(cat "$HW_JOBLOG" 2>/dev/null)" "teardown done $teardown_path" \
+  "the job log records the teardown finishing"
 
 group "a review mark reaches the sidebar as a token"
 rv_path="$HW_ROOT/alpha/feature-two"

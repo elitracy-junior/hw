@@ -40,6 +40,12 @@ HW_AGENT="${HW_AGENT:-claude}"
 HW_BRANCH_PREFIX="${HW_BRANCH_PREFIX:-eli/}"
 HW_LINEAR_SERVICE="${HW_LINEAR_SERVICE:-hw-linear}"
 HW_WATCH_INTERVAL="${HW_WATCH_INTERVAL:-90}"
+# The repos a typed or dictated spawn chooses between, one "<project>: <what it
+# is>" per line, the default first. The descriptions are what the request is
+# matched against, alongside each repo's recent branch names.
+HW_SPAWN_REPOS="${HW_SPAWN_REPOS:-\
+junior: the Junior product and the default: web app, API, projects, tracker and insights grid, sessions and calls, uploads and transcription, access groups and tags, inngest pipelines
+cs-ops: internal customer-success and on-call tooling: the on-call command center and its views (stranded and stuck calls, globe, network grid, telemetry), support workflows, Retool replacements}"
 # Marks a PR-review space, in its label and in every picker. U+F407 is the
 # Nerd Font pull-request glyph: it exists in the terminal font in BOTH regular
 # and bold, which a plain-Unicode arrow like U+21C4 does not. fzf bolds the
@@ -100,6 +106,31 @@ alt-g:first,alt-G:last,\
 alt-w:backward-kill-word,\
 alt-0:beginning-of-line,alt-4:end-of-line,\
 esc:abort}"
+
+# Pick a line from stdin, starting from search terms when there are some. The
+# terms come from a dictated request, so they are matched exactly: fuzzy
+# matching several loose words finds their letters scattered across unrelated
+# lines. One match is taken as is, several open the picker narrowed to them,
+# and none opens it on everything, saying so.
+pick_matching() {
+  local query=${1:-} list matches n=0
+  shift
+  list=$(cat)
+  if [[ -n $query ]]; then
+    matches=$(fzf --exact --filter "$query" <<<"$list" || true)
+    [[ -n $matches ]] && n=$(grep -c . <<<"$matches")
+    if (( n == 1 )); then
+      printf '%s\n' "$matches"
+      return 0
+    fi
+    if (( n > 1 )); then
+      list=$matches
+    else
+      set -- "$@" --header="nothing matched \"$query\"; pick one"
+    fi
+  fi
+  _fzf "$@" <<<"$list"
+}
 
 # Every picker in hw goes through this so the bindings stay consistent.
 # fzf keeps the cursor's index when the query changes, which lands it part way
@@ -262,40 +293,153 @@ slug_concise() {
     | sed -E 's/-+$//'
 }
 
+# One quick question to Claude: prints its last line of reply, or nothing when
+# it times out. Records how it went in the job log, since a popup is gone
+# before its warnings can be read.
+#
+# The call runs bare of everything a full session loads: no MCP servers, no
+# settings (so no hooks, plugins, or prompt-injecting context), no tools, no
+# skills, no saved session. That startup was most of a 7-9s call, which the
+# timeout below cut off under load; lean it answers in about 2s. Its stdin is
+# closed: `claude -p` appends whatever it can read there to the prompt, and
+# waits for it when there is nothing yet.
+ask_model() {
+  local what=${1:?} system=${2:?} input=${3:?} tmp pid waited=0 limit reply=""
+  limit=$(( ${HW_NAME_TIMEOUT:-15} * 10 ))
+  [[ ${HW_SMART_BRANCH:-1} == 1 ]] && command -v claude >/dev/null 2>&1 || return 0
+  tmp=$(mktemp) || return 0
+  ( cd "${TMPDIR:-/tmp}" && claude -p "$input" \
+      --system-prompt "$system" \
+      --model "${HW_NAME_MODEL:-haiku}" \
+      --strict-mcp-config --setting-sources "" --tools "" \
+      --disable-slash-commands --no-session-persistence \
+      </dev/null >"$tmp" 2>/dev/null ) &
+  pid=$!
+  # No `timeout` binary on macOS, so poll rather than block forever.
+  while kill -0 "$pid" 2>/dev/null && (( waited < limit )); do
+    sleep 0.1; waited=$((waited + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    warn "$what timed out; falling back"
+    job_log "$what timed out after $((waited / 10))s"
+  else
+    wait "$pid" 2>/dev/null || true
+    reply=$(tail -1 "$tmp" 2>/dev/null | tr -d '\r`"'"'" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')
+    job_log "$what answered in $((waited / 10))s: ${reply:0:80}"
+  fi
+  rm -f "$tmp"
+  printf '%s' "$reply"
+}
+
+# A model's branch name, or nothing if the reply is not one. A name is one
+# hyphenated token; anything else is the model talking, which slugs into a
+# sentence. A long name is fine, `slug` caps it.
+branch_name_from() {
+  local reply=${1:-}
+  # Told not to, it still sometimes prefixes one: `feature/voice-notes`.
+  reply=${reply##*/}
+  [[ $reply =~ ^[A-Za-z0-9]+(-[A-Za-z0-9]+){0,5}$ ]] && slug "$reply"
+  return 0
+}
+
 # A short, meaningful branch name for a free-text prompt. Asks Claude for a
 # 2-4 word name, since slugging the whole sentence produces things like
 # `eli/can-you-create-new-sessions-for-my-nvim-git-plug`.
 branch_name_for() {
-  local prompt=${1:-} name="" tmp pid waited=0 limit
-  limit=$(( ${HW_NAME_TIMEOUT:-15} * 10 ))
-
-  if [[ ${HW_SMART_BRANCH:-1} == 1 ]] && command -v claude >/dev/null 2>&1; then
-    info "naming the branch…"
-    tmp=$(mktemp)
-    ( claude -p "Task: $prompt
-
-Reply with ONLY a git branch name for this task: 2-4 lowercase words, hyphen-separated. No prefix, no quotes, no explanation." \
-        --model "${HW_NAME_MODEL:-haiku}" >"$tmp" 2>/dev/null ) &
-    pid=$!
-    # No `timeout` binary on macOS, so poll rather than block forever.
-    while kill -0 "$pid" 2>/dev/null && (( waited < limit )); do
-      sleep 0.1; waited=$((waited + 1))
-    done
-    if kill -0 "$pid" 2>/dev/null; then
-      kill "$pid" 2>/dev/null || true
-      warn "naming timed out; falling back"
-    else
-      wait "$pid" 2>/dev/null || true
-      name=$(slug "$(tail -1 "$tmp" 2>/dev/null | tr -d '\r')")
-    fi
-    rm -f "$tmp"
-    # Guard against a chatty reply sneaking through.
-    (( ${#name} > 40 )) && name=""
-  fi
-
+  local prompt=${1:-} name
+  info "naming the branch…"
+  name=$(branch_name_from "$(ask_model naming \
+    "Reply with ONLY a git branch name for the task: 2-4 lowercase words, hyphen-separated. No prefix, no quotes, no explanation." \
+    "Task: $prompt")")
   [[ -z $name ]] && name=$(slug_concise "$prompt")
   [[ -z $name ]] && name=$(slug "$prompt")
   printf '%s' "$name"
+}
+
+# What a typed or dictated request is asking for, as
+# "<kind><TAB><repo><TAB><detail>":
+#
+#   create <repo> <branch-name>   build, fix, change, investigate: the default
+#   review <repo> <search terms>  explicitly asked to review a PR
+#   branch <repo> <search terms>  explicitly asked to pull down or check out a branch
+#
+# <repo> is one of HW_SPAWN_REPOS, or empty when the request does not say
+# enough to tell. One call does the routing and, for the common case, the
+# naming. A reply it cannot read is new work in no repo yet, named offline.
+route_request() {
+  local request=${1:?} repos first context="" proj main reply kind repo detail name
+  repos=$(spawn_repo_names)
+  first=$(head -n 1 <<<"$repos")
+  while read -r proj; do
+    [[ -z $proj ]] && continue
+    context+="$(grep -m1 "^$proj:" <<<"$HW_SPAWN_REPOS")"$'\n'
+    main=$(project_src "$proj" 2>/dev/null) || main=""
+    [[ -n $main ]] && context+="  recent branches: $(git -C "$main" for-each-ref \
+      --sort=-committerdate --count=15 --format='%(refname:lstrip=2)' refs/heads 2>/dev/null \
+      | paste -sd, -)"$'\n'
+  done <<<"$repos"
+  info "reading the request…"
+  reply=$(ask_model routing "You route a developer's typed or dictated request to start work. Reply with exactly one line and nothing else, in one of these forms:
+create <repo> <branch-name>
+review <repo> <search terms>
+branch <repo> <search terms>
+Use create for anything that asks to build, fix, change, investigate or write something; it is the default, so use it whenever unsure. <branch-name> is 2-4 lowercase hyphenated words naming this task; never reuse a branch name listed below.
+Use review only when the request explicitly asks to review a pull request or someone's changes.
+Use branch only when the request explicitly asks to pull down, check out or open an existing branch or pull request without reviewing it.
+<search terms> are the few words that identify it: branch-name fragments, a PR number, the author's name, words from its title.
+<repo> is one of the repositories below. A request that just says the repo means the first one, and so does work that is plainly about the product. A feature, view or page named in a repository's description or branches belongs to that repository. Use ? when the request could belong to more than one and nothing in it settles which.
+Examples:
+add a retry button to the uploads page -> create ${first} uploads-retry-button
+review sams PR about the export timeout -> review ${first} sam export timeout
+pull down the billing banner branch so I can compare against it -> branch ${first} billing banner
+check out 4512 -> branch ${first} 4512
+${context}" \
+    "Request: $request")
+  read -r kind repo detail <<<"$reply"
+  grep -qxF -- "${repo:-?}" <<<"$repos" || repo=""
+  case "$kind" in
+    review|branch)
+      # Search terms that ran on into prose are no search at all; keep the
+      # number in them if there is one, else open the picker unfiltered.
+      if (( $(wc -w <<<"$detail") > 8 )); then
+        detail=$(grep -oE '#?[0-9]{2,6}' <<<"$detail" | head -n 1 | tr -d '#')
+      fi
+      printf '%s\t%s\t%s' "$kind" "$repo" "$detail"
+      return 0
+      ;;
+    create) name=$(branch_name_from "$detail") ;;
+  esac
+  [[ -z ${name:-} ]] && name=$(slug_concise "$request")
+  [[ -z $name ]] && name=$(slug "$request")
+  printf 'create\t%s\t%s' "$repo" "$name"
+}
+
+# The projects a spawn chooses between, default first.
+spawn_repo_names() {
+  awk -F: 'NF > 1 { gsub(/^[ \t]+|[ \t]+$/, "", $1); print $1 }' <<<"$HW_SPAWN_REPOS"
+}
+
+# Ask which repo, when the request did not say: the spawn repos first, then
+# everything else.
+choose_repo() {
+  local header=${1:-which repo?} pick
+  pick=$({ spawn_repo_names; printf '%s\n' "other…"; } \
+         | _fzf --prompt='repo > ' --header="$header") || return 1
+  [[ $pick == "other…" ]] || { printf '%s' "$pick"; return 0; }
+  pick=$(pick_repo) || return 1
+  [[ $pick == "+add" ]] && pick=$(add_folder_interactive)
+  printf '%s' "$pick"
+}
+
+# A project's checkout to work from, asking for the project when there is none.
+spawn_src() {
+  local proj=${1:-} header=${2:-which repo?} src
+  [[ -n $proj ]] || proj=$(choose_repo "$header") || return 1
+  [[ -n $proj ]] || return 1
+  src=$(ensure_repo "$proj") || return 1
+  [[ -n $src ]] || die "could not resolve a git source for '$proj'"
+  printf '%s' "$src"
 }
 
 # Repo the caller is standing in, resolved to its main checkout name.
@@ -667,9 +811,15 @@ workspace_has_agent() {
 
 # Move a path out of the way instead of deleting it. Everything hw discards
 # goes here, so a wrong guess is always recoverable.
+# A fresh name in the trash for a checkout leaving its place. The trash sits
+# beside the worktrees, on the same disk, so moving one there is a rename.
+trash_dest() {
+  printf '%s' "$HW_ROOT/.hw-trash/$(date +%Y%m%d-%H%M%S)-$$-$(basename "${1:?}")"
+}
+
 quarantine_path() {
   local path=${1:?} dest
-  dest="$HW_ROOT/.hw-trash/$(date +%Y%m%d-%H%M%S)-$(basename "$path")"
+  dest=$(trash_dest "$path")
   mkdir -p "$(dirname "$dest")"
   mv "$path" "$dest" || return 1
   warn "moved aside -> $dest"
@@ -747,16 +897,27 @@ job_status() {
 
 # Take a checkout off disk, whatever state it is in, and forget what hw knew
 # about it. The single owner of removal: `hw close` and `hw rm` both route here.
+#
+# A worktree of this repo is renamed into the trash first and git forgets it,
+# both instant; only then are its files deleted. That delete is the slow part
+# -- a junior checkout is ~400k files, mostly node_modules -- and nothing waits
+# on it any more. A checkout hw cannot vouch for (`orphan`, `foreign`) is only
+# moved aside, never deleted.
+#
+# Fails if a worktree's files could not all be deleted.
 remove_checkout() {
-  local path=${1:?} proj main st
+  local path=${1:?} proj main st doomed=""
   proj=$(project_of "$path")
   main=$(repo_main "$proj" 2>/dev/null || true)
   if [[ -n $main ]]; then
     st=$(worktree_state "$main" "$path")
     case "$st" in
       ready)
-        git -C "$main" worktree remove --force "$path" >/dev/null 2>&1 \
-          || quarantine_path "$path" || warn "could not remove $path"
+        # A locked worktree would survive the prune below.
+        git -C "$main" worktree unlock "$path" >/dev/null 2>&1 || true
+        doomed=$(trash_dest "$path")
+        mkdir -p "$(dirname "$doomed")"
+        mv "$path" "$doomed" 2>/dev/null || doomed=$path
         ;;
       orphan|foreign)
         if [[ -d $path ]]; then
@@ -772,23 +933,39 @@ remove_checkout() {
   # The review record is keyed by this path, so it goes with the worktree.
   review_unmark "$path"
   rm -f "$HW_BRANCHES" 2>/dev/null || true
+  [[ -z $doomed ]] && return 0
+  rm -rf "$doomed" 2>/dev/null || true
+  # Could not rename it, so it was deleted in place; git can forget it now.
+  [[ $doomed == "$path" ]] && git -C "$main" worktree prune >/dev/null 2>&1
+  [[ ! -e $doomed ]]
+}
+
+# A herdr notification, when there is a herdr to show it.
+notify() {
+  herdr notification show "${1:?}" --body "${2:-}" >/dev/null 2>&1 || true
   return 0
 }
 
-# Detached job: remove the checkout, then close the space it belonged to.
-# Closing it last is deliberate -- it is what used to kill the popup running
-# this work, which is the reason the work moved out here.
+# Detached job: close the space, then take its checkout off disk.
+#
+# The space closes first, so the sidebar drops it the moment it is asked to; the
+# files can take minutes to delete, and a notification says when they are gone.
+# Closing first is safe because this job runs in a session of its own -- closing
+# the space is what used to kill the popup doing this work.
 job_teardown() {
-  local path=${1:?} ws=${2:-}
-  HW_JOB_WS=$ws
+  local path=${1:?} ws=${2:-} name started
+  name="$(project_of "$path")/$(basename "$path")"
+  started=$(date +%s)
   job_log "teardown $path (${ws:--})"
-  # However this ends, the space must not be left reporting work nobody is
-  # doing: the row would spin forever with no job behind it.
-  trap 'job_status "$HW_JOB_WS" ""' EXIT
-  remove_checkout "$path"
   if [[ -n $ws && $ws != "-" ]]; then
-    job_status "$ws" ""
     herdr workspace close "$ws" >/dev/null 2>&1 || true
+  fi
+  if remove_checkout "$path"; then
+    job_log "teardown done $path in $(( $(date +%s) - started ))s"
+    notify "Worktree deleted" "$name"
+  else
+    job_log "teardown left files behind $path"
+    notify "Worktree not fully deleted" "$name: some files could not be removed"
   fi
   return 0
 }
@@ -1215,7 +1392,7 @@ cmd_new() {
 
 cmd_branch() {
   need fzf
-  local main pick branch base
+  local main pick branch base query=${2:-}
   main=${1:-$(pick_project_main)} || return 0
   [[ -z $main ]] && return 0
 
@@ -1235,7 +1412,7 @@ cmd_branch() {
       git -C "$main" for-each-ref --sort=-committerdate --count=200 \
         --format='%(refname:lstrip=2)' refs/heads
     } | grep -vx 'HEAD' | awk 'NF && !seen[$0]++' \
-      | _fzf --prompt='branch > '
+      | pick_matching "$query" --prompt='branch > '
   ) || return 0
 
   branch=$pick
@@ -1376,8 +1553,7 @@ cmd_rm() {
   confirm "remove it" "$path" || return 0
 
   [[ -z $ws || $ws == "-" ]] && ws=$(workspace_for_path "$path")
-  info "removing $path in the background"
-  job_status "$ws" "tearing down"
+  info "removing $path; a notification says when it is deleted"
   detach "$HW_SELF" __teardown "$path" "$ws"
 }
 
@@ -1459,8 +1635,7 @@ cmd_close() {
         confirm "remove it anyway" "$(basename "$path") has${note}" \
           || { info "cancelled"; return 0; }
       fi
-      info "removing $label in the background"
-      job_status "$ws" "tearing down"
+      info "removing $label; a notification says when it is deleted"
       detach "$HW_SELF" __teardown "$path" "$ws"
       ;;
     *) return 0 ;;
@@ -1929,40 +2104,76 @@ cmd_sync() {
 # a GUI. Sub-commands take the resolved source so nothing asks twice.
 cmd_spawn() {
   need fzf
-  local proj src pick action
-  proj=$(pick_repo) || return 0
-  [[ -z $proj ]] && return 0
-
-  if [[ $proj == "+add" ]]; then
-    proj=$(add_folder_interactive) || return 0
-    [[ -z $proj ]] && return 0
+  local pick action src
+  pick=$(pick_spawn) || return 0
+  action=${pick%%$'\t'*}
+  if [[ $action == prompt ]]; then
+    spawn_request "${pick#*$'\t'}"
+    return 0
   fi
-
-  src=$(ensure_repo "$proj") || return 0
-  [[ -z $src ]] && die "could not resolve a git source for '$proj'"
-
-  pick=$(printf '%s\n' \
-    "branch   branch or PR     check out existing work" \
-    "review   review a PR      worktree + Claude running the pr-review skill" \
-    "prompt   new prompt       describe it, Claude picks up from there" \
-    "linear   Linear ticket    pick one of your assigned issues" \
-    "open     default branch   just open the repo" \
-    | _fzf --prompt="$proj > " --header="what in $proj?") || return 0
-  action=$(awk '{print $1}' <<<"$pick")
-
+  src=$(spawn_src "" "$action in which repo?") || return 0
   case "$action" in
     branch) cmd_branch "$src" ;;
     review) cmd_review "$src" ;;
-    prompt) cmd_new_in "$src" ;;
+    editor) cmd_new_in "$src" ;;
     linear) cmd_linear "$src" ;;
     open)   cmd_open_default "$src" ;;
   esac
 }
 
+# Act on a typed or dictated request: most are new work; a request to review
+# or pull down a branch opens that picker already searching for it. The repo
+# comes from the request, and is asked for when the request does not settle it.
+spawn_request() {
+  local request=${1:?} routed rest kind repo detail src
+  routed=$(route_request "$request")
+  # Not `IFS=$'\t' read`: tab counts as whitespace there, so an empty repo
+  # field would vanish and the name would be read as the repo.
+  kind=${routed%%$'\t'*}
+  rest=${routed#*$'\t'}
+  repo=${rest%%$'\t'*}
+  detail=${rest#*$'\t'}
+  src=$(spawn_src "$repo" "which repo for: ${request:0:70}") || return 0
+  case "$kind" in
+    review) cmd_review "$src" "$detail" ;;
+    branch) cmd_branch "$src" "$detail" ;;
+    *)      cmd_new_in "$src" "$request" "$detail" ;;
+  esac
+}
+
+# What to spawn: "<action>" or "prompt<TAB><text>".
+#
+# Nearly every spawn is a prompt, so typing on this page writes one. The list
+# does not filter (--disabled), so the arrows still pick an action when nothing
+# is typed, and the preview shows the prompt wrapped as a block -- fzf's own
+# query line scrolls sideways, off the edge of the page.
+pick_spawn() {
+  local out query pick
+  out=$(printf '%s\n' \
+    "branch   branch or PR     check out existing work" \
+    "review   review a PR      worktree + Claude running the pr-review skill" \
+    "linear   Linear ticket    pick one of your assigned issues" \
+    "open     default branch   just open the repo" \
+    "editor   new prompt       write the prompt in \$EDITOR" \
+    | _fzf --disabled --print-query --prompt="spawn > " \
+        --header="type or dictate it: new work, a PR to review, a branch to pull; or pick one:" \
+        --preview='[ -n {q} ] && printf "%s\n" {q} || printf "\033[2m%s\033[0m\n" "start typing: it becomes the prompt for a new worktree"' \
+        --preview-window='down,70%,wrap-word,border-top' \
+        --bind 'change:refresh-preview') || return 1
+  query=$(head -n 1 <<<"$out")
+  pick=$(sed -n 2p <<<"$out")
+  if [[ -n ${query//[[:space:]]/} ]]; then
+    printf 'prompt\t%s' "$query"
+    return 0
+  fi
+  [[ -n $pick ]] || return 1
+  awk '{print $1}' <<<"$pick"
+}
+
 # Spawn a worktree for an open PR and hand it to Claude for review.
 cmd_review() {
   need fzf; need gh
-  local src=${1:?} proj pick branch num prompt
+  local src=${1:?} query=${2:-} proj pick branch num prompt
 
   if [[ $src == "$HW_ROOT"/* ]]; then proj=$(project_of "$src")
   else proj=$(registry_name_for_src "$src"); [[ -n $proj ]] || proj=$(basename "$src"); fi
@@ -1974,11 +2185,21 @@ cmd_review() {
 
   # Branch name only, same as the branch picker; the PR number rides along in
   # a trailing field that fzf still matches on but which stays readable.
-  pick=$(gh pr list --repo "$HW_ORG/$proj" --limit 100 \
-           --json number,headRefName,title \
-           --jq '.[] | "\(.headRefName)\t#\(.number)  \(.title)"' 2>/dev/null \
-         | column -t -s$'\t' \
-         | _fzf --prompt="review $proj > " --header='pick a PR to review') || return 0
+  # A PR asked for by number is looked up directly: it need not be among the
+  # recent open ones the picker lists.
+  query=${query#\#}
+  if [[ $query =~ ^[0-9]+$ ]]; then
+    pick=$(gh pr view "$query" --repo "$HW_ORG/$proj" --json number,headRefName,title \
+             --jq '"\(.headRefName)  #\(.number)  \(.title)"' 2>/dev/null) \
+      || die "no PR #$query in $HW_ORG/$proj"
+  else
+    pick=$(gh pr list --repo "$HW_ORG/$proj" --limit 100 \
+             --json number,headRefName,title,author \
+             --jq '.[] | "\(.headRefName)\t#\(.number)  \(.title)  @\(.author.login)"' 2>/dev/null \
+           | column -t -s$'\t' \
+           | pick_matching "$query" --prompt="review $proj > " --header='pick a PR to review') \
+      || return 0
+  fi
   [[ -z $pick ]] && return 0
 
   branch=$(awk '{print $1}' <<<"$pick")
@@ -2019,9 +2240,10 @@ cmd_open_default() {
 
 # Prompt-seeded worktree in an already-chosen project.
 cmd_new_in() {
-  local src=${1:?} prompt branch
-  prompt=$(compose) || return 0
-  branch="${HW_BRANCH_PREFIX}$(branch_name_for "$prompt")"
+  local src=${1:?} prompt=${2:-} name=${3:-} branch
+  [[ -n $prompt ]] || prompt=$(compose) || return 0
+  [[ -n $name ]] || name=$(branch_name_for "$prompt")
+  branch="${HW_BRANCH_PREFIX}${name}"
   create_worktree "$src" "$branch" \
     "$(git -C "$src" symbolic-ref --quiet --short HEAD 2>/dev/null || echo HEAD)" \
     "" "$prompt" >/dev/null

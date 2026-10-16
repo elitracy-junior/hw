@@ -140,8 +140,29 @@ Registered folders stay exactly where they are; their worktrees still land
 under `$HW_ROOT/<name>/<branch-slug>`. The registry is
 `~/.config/hw/projects.tsv` (`<name>\t<path>`), safe to hand-edit.
 
-Spawning is deliberately **not** cwd-aware — `hw spawn` always asks which
-project first, so any branch of any repo can be started from anywhere.
+Spawning is deliberately **not** cwd-aware, so any branch of any repo can be
+started from anywhere.
+
+## Spawning from one line
+
+`hw spawn` (`prefix g`) opens straight onto a prompt. Type or dictate what you
+want and press enter; the text wraps in a block below as it grows. One quick
+model call reads it:
+
+- **new work** (the default) — names the branch and spawns the worktree with
+  Claude seeded with the request.
+- **"review …"** — opens the PR picker already searching for it; one exact
+  match is taken without asking. A PR number is looked up directly.
+- **"pull down / check out … branch"** — the same, in the branch picker.
+
+It also picks the repo from `HW_SPAWN_REPOS` (one `name: what it is` per
+line, the default first — junior, then cs-ops), matching the request against
+each repo's description and recent branch names. "The repo" means the first.
+When the request does not settle it, it asks: junior, cs-ops, or other….
+
+With nothing typed, the arrows pick an action instead (branch, review, linear,
+open, or `editor` to write the prompt in `$EDITOR`), and it then asks which
+repo.
 Tune discovery with `HW_SCAN_DIRS` / `HW_SCAN_DEPTH` in `config.sh`.
 
 ## Writing the prompt
@@ -198,9 +219,12 @@ A prompted worktree gets a short name, not a slug of the whole sentence:
                                    ->  eli/add-api-rate-limiting
 ```
 
-`claude -p --model haiku` picks the name (~7s). If it is slow, unavailable, or
-returns something chatty, `hw` falls back to stripping filler words and keeping
-the first few meaningful ones — `eli/fix-flaky-retry-logic`. There is no
+`claude -p --model haiku` picks the name (~2s). The call runs bare: no MCP
+servers, settings, hooks, tools or skills, and stdin closed — a full session's
+startup made it 7-9s and the cap cut it off under load. If it is slow,
+unavailable, or returns something other than one hyphenated name, `hw` falls
+back to stripping filler words and keeping the first few meaningful ones —
+`eli/fix-flaky-retry-logic`. Each attempt is a line in the job log. There is no
 `timeout` binary on macOS, so the wait is polled and capped.
 
 ```sh
@@ -403,8 +427,9 @@ A workspace pointing at anything but `ready` is closed as stale rather than
 focused. If the branch is already checked out in a *different* worktree, that
 one is opened instead of failing.
 
-**Nothing is ever deleted outright.** Anything hw discards is moved to
-`$HW_ROOT/.hw-trash/<timestamp>-<name>`, so a wrong guess is recoverable.
+**A checkout hw cannot vouch for is never deleted.** An orphan or foreign
+directory is moved to `$HW_ROOT/.hw-trash/<timestamp>-<name>`, so a wrong guess
+is recoverable. A real worktree of the repo is deleted.
 
 ## Closing one session
 
@@ -414,7 +439,10 @@ them as a group. `hw close` (`prefix d`) acts on the current workspace alone
 and asks what to do with its worktree:
 
 - **keep** — close the session, leave the worktree so you can reopen it later
-- **remove** — close the session and remove the worktree
+- **remove** — close the session and remove the worktree. The space closes at
+  once; the worktree is renamed into the trash and git forgets it, then its
+  files are deleted in the background (a junior checkout is ~400k files) and a
+  herdr notification says when it is gone.
 - **cancel**
 
 herdr's own `close_workspace` and `remove_worktree` are set to `""`, so every
