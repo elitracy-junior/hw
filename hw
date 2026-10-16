@@ -2,7 +2,8 @@
 # hw — herdr work: worktree spawning, project switching, and git/CI/PR helpers.
 # Replaces the Orca workflow with herdr + nvim + lazygit + gh.
 #
-#   hw spawn          one picker: Linear ticket / branch / prompt / project
+#   hw spawn          pick a repo, then: branch / review / prompt / Linear / open
+#   hw ask            type or dictate the work; repo and kind are detected
 #   hw add [folder]   register an existing local repo as a project
 #   hw projects       list known projects
 #   hw spaces         popup picker over open sessions
@@ -2135,26 +2136,47 @@ cmd_sync() {
 # a GUI. Sub-commands take the resolved source so nothing asks twice.
 cmd_spawn() {
   need fzf
-  local request action src
-  request=$(ask_request) || return 0
-  if [[ $request != "$HW_PICK_ACTION" ]]; then
-    spawn_request "$request"
-    return 0
+  local proj src pick action
+  proj=$(pick_repo) || return 0
+  [[ -z $proj ]] && return 0
+
+  if [[ $proj == "+add" ]]; then
+    proj=$(add_folder_interactive) || return 0
+    [[ -z $proj ]] && return 0
   fi
-  action=$(printf '%s\n' \
-    "branch   pull a branch or PR" \
-    "review   review a PR" \
-    "linear   start from a Linear ticket" \
-    "open     open the repo on its default branch" \
-    | _fzf --prompt='action > ' | awk '{print $1}') || return 0
-  [[ -n $action ]] || return 0
-  src=$(spawn_src "" "$action in which repo?") || return 0
+
+  src=$(ensure_repo "$proj") || return 0
+  [[ -z $src ]] && die "could not resolve a git source for '$proj'"
+
+  pick=$(printf '%s\n' \
+    "branch   branch or PR     check out existing work" \
+    "review   review a PR      worktree + Claude running the pr-review skill" \
+    "prompt   new prompt       describe it, Claude picks up from there" \
+    "linear   Linear ticket    pick one of your assigned issues" \
+    "open     default branch   just open the repo" \
+    | _fzf --prompt="$proj > " --header="what in $proj?") || return 0
+  action=$(awk '{print $1}' <<<"$pick")
+
   case "$action" in
     branch) cmd_branch "$src" ;;
     review) cmd_review "$src" ;;
+    prompt) cmd_new_in "$src" ;;
     linear) cmd_linear "$src" ;;
     open)   cmd_open_default "$src" ;;
   esac
+}
+
+# Start work from one typed or dictated line: the repo, and whether it is new
+# work, a review or a branch, are worked out from what it says. ctrl-o in the
+# box goes to the explicit pickers instead.
+cmd_ask() {
+  local request
+  request=$(ask_request) || return 0
+  if [[ $request == "$HW_PICK_ACTION" ]]; then
+    cmd_spawn
+    return 0
+  fi
+  spawn_request "$request"
 }
 
 # Act on a typed or dictated request: most are new work; a request to review
@@ -2204,6 +2226,13 @@ cmd_sandbox() {
   printf '%s\n' "$ws"
 }
 
+# Enter in a picker where a typed number is an answer in itself: a query of
+# digits (an optional leading #) is printed as it is, anything else accepts the
+# selected row. The {q} for `become` is assembled by printf so that fzf fills
+# it in only then, quoted; written out, fzf would also fill it into this
+# script, where a leading # opens a comment.
+HW_NUMBER_ENTER="enter:transform:case {q} in ''|*[!0-9#]*) echo accept ;; *) printf 'become(echo {%s})' q ;; esac"
+
 # What ask_request prints when the action list was asked for instead.
 HW_PICK_ACTION=$'\x01action'
 
@@ -2228,7 +2257,7 @@ o.shortmess = o.shortmess .. "I"
 o.fillchars = "eob: "
 o.laststatus, o.cmdheight = 2, 0
 o.winbar = "%#Title#  auto%* %#Comment#describe the work: the repo, and whether it is new work, a review or a branch, are picked up from what you say%*"
-o.statusline = "%#Comment#  enter start   ctrl-j new line   ctrl-o pick an action instead   esc esc cancel%*"
+o.statusline = "%#Comment#  enter start   ctrl-j new line   ctrl-o pick the repo and action instead   esc esc cancel%*"
 local function done(code) vim.cmd("silent! write"); vim.cmd("cquit " .. code) end
 vim.keymap.set({ "i", "n" }, "<CR>", function() done(0) end)
 vim.keymap.set({ "i", "n" }, "<C-o>", function()
@@ -2281,14 +2310,32 @@ cmd_review() {
              --json number,headRefName,title,author \
              --jq '.[] | "\(.headRefName)\t#\(.number)  \(.title)  @\(.author.login)"' 2>/dev/null \
            | column -t -s$'\t' \
-           | pick_matching "$query" --prompt="review $proj > " --header='pick a PR to review') \
+           | pick_matching "$query" --prompt="review $proj > " \
+               --header='pick a PR to review, or type its number' \
+               --bind "$HW_NUMBER_ENTER") \
       || return 0
+    # A typed number comes back on its own: look that PR up, whether or not it
+    # is among the recent open ones listed.
+    query=${pick#\#}
+    if [[ $query =~ ^[0-9]+$ ]]; then
+      pick=$(gh pr view "$query" --repo "$HW_ORG/$proj" --json number,headRefName,title \
+               --jq '"\(.headRefName)  #\(.number)  \(.title)"' 2>/dev/null) \
+        || die "no PR #$query in $HW_ORG/$proj"
+    fi
   fi
   [[ -z $pick ]] && return 0
 
   branch=$(awk '{print $1}' <<<"$pick")
   num=$(grep -oE '#[0-9]+' <<<"$pick" | head -1 | tr -d '#')
   [[ -z $branch || -z $num ]] && die "could not parse the selected PR"
+  # A merged PR's branch is often deleted, and a fork's never was on origin;
+  # GitHub keeps every PR's head at pull/<n>/head.
+  if ! git -C "$src" show-ref --verify --quiet "refs/heads/$branch" \
+     && ! git -C "$src" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+    info "fetching PR #$num"
+    git -C "$src" fetch --quiet origin "pull/$num/head:$branch" \
+      || die "could not fetch PR #$num"
+  fi
 
   prompt="Use the pr-review skill to review PR #${num} (branch ${branch}) in ${HW_ORG}/${proj}.
 
@@ -2350,7 +2397,7 @@ herdr_ready() {
 
 needs_herdr() {
   case "${1:?}" in
-    spawn|menu|proj|p|new|n|branch|b|linear|l|rm|spaces|s|agents|ag) return 0 ;;
+    spawn|menu|ask|proj|p|new|n|branch|b|linear|l|rm|spaces|s|agents|ag) return 0 ;;
     reviews|rv|close|x|doctor|sync|watch|__teardown|__setup) return 0 ;;
     *) return 1 ;;
   esac
@@ -2363,6 +2410,7 @@ main() {
   fi
   case "$sub" in
     spawn|menu)    cmd_spawn ;;
+    ask)           cmd_ask ;;
     proj|p)        cmd_proj ;;
     new|n)         cmd_new "$@" ;;
     branch|b)      cmd_branch ;;

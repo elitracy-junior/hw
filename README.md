@@ -145,8 +145,16 @@ started from anywhere.
 
 ## Spawning from one line
 
-`hw spawn` (`prefix g`) opens straight onto one block of text, headed
-**auto**. Type or dictate what you want and press enter; the text wraps as it
+Two entry points:
+
+- **`hw spawn`** (`prefix g`) — explicit: pick the repo, then branch / review /
+  prompt / Linear / open. In the review picker, type a PR number and press
+  enter to take that PR even when it is not listed (merged, or older than the
+  100 most recent open); a branch gone from origin is fetched from
+  `pull/<n>/head`.
+- **`hw ask`** (`prefix space`) — detected: one block of text, described below.
+
+`hw ask` opens straight onto one block of text, headed **auto**. Type or dictate what you want and press enter; the text wraps as it
 arrives and keeps pasted line breaks. It is a bare `nvim --clean`, so it opens
 at once and your config cannot change its keys:
 
@@ -154,7 +162,7 @@ at once and your config cannot change its keys:
 |---|---|
 | `enter` | start |
 | `ctrl-j` | new line |
-| `ctrl-o` | pick an action instead: pull a branch, review a PR, a Linear ticket, open the repo |
+| `ctrl-o` | go to `hw spawn` instead: pick the repo, then the action |
 | `esc` `esc` | cancel (one `esc` is normal mode, for editing) |
 
 One quick model call reads the text:
@@ -181,8 +189,6 @@ Sandbox sessions nest under one **sandbox** heading in the sidebar: hw reports
 `group=sandbox` on every workspace opened in `HW_SANDBOX_DIR` (on creation, and
 again on each `hw sync` / `hw watch`, since metadata does not outlive the herdr
 server). Needs the patched herdr, which groups spaces by that token.
-
-An action picked with `ctrl-o` then asks which repo.
 
 Tune discovery with `HW_SCAN_DIRS` / `HW_SCAN_DEPTH` in `config.sh`.
 
@@ -260,7 +266,8 @@ HW_NAME_TIMEOUT=15
 |---|---|
 | `prefix s` | **`hw spaces`** — popup picker over open sessions |
 | `prefix a` | **`hw agents`** — popup picker over live agents, across all spaces |
-| `prefix g` | **`hw spawn`** — one picker: Linear ticket / branch / prompt / project |
+| `prefix g` | **`hw spawn`** — pick a repo, then branch / review / prompt / Linear / open |
+| `prefix space` | **`hw ask`** — type or dictate the work; repo and kind are detected |
 | `prefix l` | lazygit popup |
 | `prefix shift+g` | herdr's native new-worktree prompt |
 | `prefix alt+g` | herdr's native open-worktree picker |
